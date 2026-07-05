@@ -153,13 +153,15 @@ object HuggingFaceModelBrowser {
         return KNOWN_SIZES[variant] ?: 200
     }
 
-    /** Convert an HFModel into a Model so it works with the existing ModelDownloader. */
+    /** Convert an HFModel into a Model so it works with the existing ModelDownloader.
+     *  hfRepo drives the fast per-file download; downloadUrl is the archive fallback. */
     fun toModel(hf: HFModel): Model = Model(
         name = hf.displayName,
         archive = hf.archive,
         sizeMb = hf.sizeMb,
         quality = hf.languages,
         recommended = false,
+        hfRepo = hf.repoId,
         downloadUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${hf.archive}.tar.bz2",
     )
 }
