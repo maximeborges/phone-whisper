@@ -26,15 +26,18 @@ data class Model(
     val hfRepo: String? = null,
 )
 
+// Sizes are the actual download for the path each model uses (HF int8 files when
+// available, else the .tar.bz2 archive). Verified against the sherpa-onnx HF repos.
 val MODEL_CATALOG = listOf(
+    // No complete int8 HF mirror — falls back to the 100 MB archive (→126 MB on disk).
     Model("Parakeet 110M", "sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8",
         100, "★★★ Best value", recommended = true),
     Model("Whisper Base", "sherpa-onnx-whisper-base.en",
-        199, "★★★"),
+        153, "★★★", hfRepo = "csukuangfj/sherpa-onnx-whisper-base.en"),
     Model("Parakeet 0.6B", "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
-        465, "★★★★ Best quality"),
+        639, "★★★★ Best quality", hfRepo = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"),
     Model("Moonshine Tiny", "sherpa-onnx-moonshine-tiny-en-int8",
-        103, "★★☆ Fast"),
+        118, "★★☆ Fast", hfRepo = "csukuangfj/sherpa-onnx-moonshine-tiny-en-int8"),
 )
 
 sealed class DownloadState {
