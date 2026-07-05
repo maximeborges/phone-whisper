@@ -24,6 +24,8 @@ data class Model(
     /** HuggingFace repo (e.g. "csukuangfj/sherpa-onnx-whisper-base") to fetch individual,
      *  uncompressed files from. If null, defaults to "csukuangfj/<archive>". */
     val hfRepo: String? = null,
+    /** Model architecture, persisted so the loader builds the right config. */
+    val arch: ModelArch = ModelArch.UNKNOWN,
 )
 
 // Sizes are the actual download for the path each model uses (HF int8 files when
@@ -31,13 +33,25 @@ data class Model(
 val MODEL_CATALOG = listOf(
     // No complete int8 HF mirror — falls back to the 100 MB archive (→126 MB on disk).
     Model("Parakeet 110M", "sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8",
-        100, "★★★ Best value", recommended = true),
+        100, "★★★ Best value · English", recommended = true, arch = ModelArch.NEMO_CTC),
+    Model("Multilingual (NeMo CTC)", "sherpa-onnx-nemo-fast-conformer-ctc-en-de-es-fr-14288",
+        439, "★★★ en/de/es/fr · auto",
+        hfRepo = "csukuangfj/sherpa-onnx-nemo-fast-conformer-ctc-en-de-es-fr-14288",
+        arch = ModelArch.NEMO_CTC),
+    Model("Canary (multilingual)", "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8",
+        198, "★★★★ en/es/de/fr · set language",
+        hfRepo = "csukuangfj/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8",
+        arch = ModelArch.CANARY),
     Model("Whisper Base", "sherpa-onnx-whisper-base.en",
-        153, "★★★", hfRepo = "csukuangfj/sherpa-onnx-whisper-base.en"),
+        153, "★★★ · English", hfRepo = "csukuangfj/sherpa-onnx-whisper-base.en",
+        arch = ModelArch.WHISPER),
     Model("Parakeet 0.6B", "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
-        639, "★★★★ Best quality", hfRepo = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"),
+        639, "★★★★ Best quality · large",
+        hfRepo = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        arch = ModelArch.TRANSDUCER),
     Model("Moonshine Tiny", "sherpa-onnx-moonshine-tiny-en-int8",
-        118, "★★☆ Fast", hfRepo = "csukuangfj/sherpa-onnx-moonshine-tiny-en-int8"),
+        118, "★★☆ Fast · English", hfRepo = "csukuangfj/sherpa-onnx-moonshine-tiny-en-int8",
+        arch = ModelArch.MOONSHINE),
 )
 
 sealed class DownloadState {
@@ -49,6 +63,9 @@ sealed class DownloadState {
 
 object ModelDownloader {
     private const val TAG = "ModelDownloader"
+    /** Written into a model dir while a download is in flight; removed only on
+     *  full success. Its presence means the model is incomplete. */
+    private const val DOWNLOADING_MARKER = ".downloading"
     private const val BASE_URL =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
     private val client = OkHttpClient.Builder()
@@ -57,8 +74,42 @@ object ModelDownloader {
     fun modelDir(ctx: Context, model: Model) =
         File(ctx.filesDir, "models/${model.archive}")
 
-    fun isInstalled(ctx: Context, model: Model) =
-        modelDir(ctx, model).exists()
+    /** A model counts as installed only once the [LocalTranscriber.ARCH_MARKER] is
+     *  present — it is written last, after every file has fully downloaded and
+     *  been size-verified. A download interrupted by the process being killed
+     *  therefore does NOT look installed (so it re-downloads instead of crashing
+     *  natively on a partial/truncated model). */
+    fun isInstalled(ctx: Context, model: Model): Boolean {
+        val dir = modelDir(ctx, model)
+        return dir.exists() && File(dir, LocalTranscriber.ARCH_MARKER).exists() &&
+            !File(dir, DOWNLOADING_MARKER).exists()
+    }
+
+    /** Archive names of fully-installed models (marker present, not mid-download). */
+    fun installedModels(ctx: Context): List<String> {
+        val dirs = File(ctx.filesDir, "models").listFiles()?.filter { it.isDirectory } ?: return emptyList()
+        return dirs.filter {
+            File(it, LocalTranscriber.ARCH_MARKER).exists() && !File(it, DOWNLOADING_MARKER).exists()
+        }.map { it.name }.sorted()
+    }
+
+    /**
+     * One-time migration for models downloaded before completion markers existed:
+     * write [LocalTranscriber.ARCH_MARKER] for any dir whose required files are all
+     * present, so it still counts as installed and routes to the right loader.
+     * MUST be run only once (guarded by the caller) — re-running would re-mark
+     * interrupted downloads and defeat the marker's protection.
+     */
+    fun migrateMarkers(ctx: Context) {
+        File(ctx.filesDir, "models").listFiles()?.filter { it.isDirectory }?.forEach { dir ->
+            if (File(dir, LocalTranscriber.ARCH_MARKER).exists()) return@forEach
+            if (File(dir, DOWNLOADING_MARKER).exists()) return@forEach // interrupted download
+            val arch = ModelArch.fromRepoName(dir.name)
+            if (LocalTranscriber.hasValidFiles(dir, arch)) {
+                runCatching { File(dir, LocalTranscriber.ARCH_MARKER).writeText(arch.id) }
+            }
+        }
+    }
 
     /** Download and extract model. Callbacks fire on background thread.
      *
@@ -85,10 +136,15 @@ object ModelDownloader {
                 }
                 if (!viaHf) {
                     Log.i(TAG, "Falling back to .tar.bz2 for ${model.archive}")
+                    val dir = modelDir(ctx, model)
+                    dir.mkdirs()
+                    File(dir, DOWNLOADING_MARKER).writeText("1")
                     downloadFile(url, tmpFile, onState)
                     onState(DownloadState.Extracting)
                     extractTarBz2(tmpFile, outDir)
                 }
+                writeArchMarker(ctx, model)
+                File(modelDir(ctx, model), DOWNLOADING_MARKER).delete() // mark complete
                 onState(DownloadState.Done)
             } catch (e: Exception) {
                 onState(DownloadState.Error(e.message ?: "Unknown error"))
@@ -114,6 +170,7 @@ object ModelDownloader {
         val modelDir = File(outDir, model.archive)
         modelDir.deleteRecursively()
         modelDir.mkdirs()
+        File(modelDir, DOWNLOADING_MARKER).writeText("1") // cleared on full success
 
         val totalBytes = files.sumOf { it.size }.coerceAtLeast(1L)
         val done = AtomicLong(0)
@@ -233,6 +290,16 @@ object ModelDownloader {
 
     fun delete(ctx: Context, model: Model) =
         modelDir(ctx, model).deleteRecursively()
+
+    /** Persist the architecture next to the model, written last as the download
+     *  completion sentinel (see [isInstalled]). Also lets the loader pick the
+     *  right config without guessing from file shape. */
+    private fun writeArchMarker(ctx: Context, model: Model) {
+        val dir = modelDir(ctx, model)
+        if (dir.exists()) {
+            runCatching { File(dir, LocalTranscriber.ARCH_MARKER).writeText(model.arch.id) }
+        }
+    }
 
     private fun downloadFile(
         url: String, dest: File, onState: (DownloadState) -> Unit

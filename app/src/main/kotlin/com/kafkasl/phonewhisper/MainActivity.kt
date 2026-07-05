@@ -11,8 +11,11 @@ import android.provider.Settings
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.widget.*
+import kotlin.math.abs
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -34,9 +37,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var promptContainer: LinearLayout
 
     private val modelRows = mutableMapOf<String, ModelRowViews>()
-    private val hfModelRows = mutableMapOf<String, ModelRowViews>()
-    private var hfModels: List<HuggingFaceModelBrowser.HFModel> = emptyList()
     private val promptRows = mutableMapOf<String, PromptRowViews>()
+    private var langRowView: LinearLayout? = null
 
     /** Archives currently downloading or extracting — not yet usable. */
     private val inProgress = mutableSetOf<String>()
@@ -55,6 +57,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // One-time: tag pre-existing (pre-marker) model downloads as complete so
+        // they still count as installed. Guarded so it never re-marks a future
+        // interrupted download.
+        if (!prefs().getBoolean("markers_migrated", false)) {
+            ModelDownloader.migrateMarkers(this)
+            prefs().edit().putBoolean("markers_migrated", true).apply()
+        }
 
         val root = vertical(0, 0)
 
@@ -104,33 +114,31 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(cloudRow)
 
-        // Local Models section
+        // Recognition language (applies to Whisper/SenseVoice/Canary; "" = auto).
+        val langRow = settingsRow("Recognition language",
+            languageSummary()) { showLanguagePicker() }
+        langRowView = langRow
+        root.addView(langRow)
+
+        // Avoid overwriting the clipboard when a keyboard is open (insert directly).
+        val avoidClipSwitch = MaterialSwitch(this).apply {
+            isChecked = prefs().getBoolean("avoid_clipboard_when_keyboard", true)
+            isClickable = false
+        }
+        root.addView(settingsRow(
+            "Avoid clipboard when keyboard is open",
+            "Insert text directly instead of copy-paste",
+            avoidClipSwitch,
+        ) {
+            val v = !avoidClipSwitch.isChecked
+            prefs().edit().putBoolean("avoid_clipboard_when_keyboard", v).apply()
+            avoidClipSwitch.isChecked = v
+        })
+
+        // Models: "Local models" (installed) + "Suggested models" + Browse button.
         modelContainer = vertical(0)
-        modelContainer.addView(sectionHeader("Local models"))
-        for (m in MODEL_CATALOG) modelContainer.addView(buildModelRow(m))
-
-        // --- Multilingual model browser ---
-        val hfContainer = vertical(0)
-        hfContainer.tag = "hf_container"
-
-        val showLargeSwitch = com.google.android.material.materialswitch.MaterialSwitch(this).apply {
-            text = "Show large models (>600 MB)"
-            textSize = 14f
-            setPadding(dp(24), dp(4), dp(24), dp(4))
-        }
-
-        val browseBtn = com.google.android.material.button.MaterialButton(this).apply {
-            text = "Browse multilingual models"
-            setOnClickListener { loadHFModels(hfContainer, showLargeSwitch.isChecked) }
-            layoutParams = LinearLayout.LayoutParams(LP_WRAP, LP_WRAP).apply {
-                leftMargin = dp(24); topMargin = dp(8); bottomMargin = dp(4)
-            }
-        }
-        modelContainer.addView(browseBtn)
-        modelContainer.addView(showLargeSwitch)
-        modelContainer.addView(hfContainer)
-
         root.addView(modelContainer)
+        rebuildModelSections()
 
         // --- Post-Processing Section ---
         root.addView(sectionHeader("Post-Processing"))
@@ -177,55 +185,197 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
-    override fun onResume() { super.onResume(); refresh() }
+    override fun onResume() {
+        super.onResume()
+        // Reflect models installed/removed elsewhere (e.g. the browser).
+        if (::modelContainer.isInitialized) rebuildModelSections()
+        refresh()
+    }
     override fun onRequestPermissionsResult(c: Int, p: Array<String>, r: IntArray) {
         super.onRequestPermissionsResult(c, p, r); refresh()
     }
 
-    // --- HuggingFace Model Browser ---
+    // --- Recognition language ---
 
-    private fun loadHFModels(container: LinearLayout, showLargeModels: Boolean = false) {
-        container.removeAllViews()
-        container.addView(TextView(this).apply {
-            text = "Loading models from HuggingFace..."
-            textSize = 14f
-            setPadding(dp(24), dp(8), dp(24), dp(8))
-            setTextColor(attrColor(android.R.attr.textColorSecondary))
+    private val LANGS = listOf(
+        "English" to "en", "French" to "fr", "German" to "de", "Spanish" to "es",
+        "Italian" to "it", "Portuguese" to "pt", "Dutch" to "nl", "Russian" to "ru",
+        "Chinese" to "zh", "Japanese" to "ja", "Korean" to "ko",
+    )
+
+    private fun currentLangCodes(): List<String> =
+        (prefs().getString("language_set", "") ?: "").split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+    private fun labelFor(code: String) = LANGS.firstOrNull { it.second == code }?.first ?: code
+
+    /** Human summary of the language selection for the settings row subtitle. */
+    private fun languageSummary(): String {
+        val codes = currentLangCodes()
+        return when {
+            codes.isEmpty() -> "Auto-detect"
+            codes.size == 1 -> "${labelFor(codes[0])} (forced)"
+            else -> codes.joinToString(", ") { labelFor(it) } + " · auto-detect"
+        }
+    }
+
+    /**
+     * Multi-select language picker. Semantics that match the model APIs:
+     * pick exactly one to force that language; pick several (or none) to
+     * auto-detect (Whisper/SenseVoice can't restrict to a subset, so any
+     * multi-selection means full auto-detect). The effective single code is
+     * stored in "language" for the loader; the checked set in "language_set".
+     */
+    private fun showLanguagePicker() {
+        val labels = LANGS.map { it.first }.toTypedArray()
+        val cur = currentLangCodes().toMutableSet()
+        val checked = BooleanArray(LANGS.size) { LANGS[it].second in cur }
+        fun persist(codes: List<String>) {
+            prefs().edit()
+                .putString("language_set", codes.joinToString(","))
+                .putString("language", if (codes.size == 1) codes[0] else "")
+                .apply()
+            langRowView?.findViewWithTag<TextView>("subtitle")?.text = languageSummary()
+            WhisperAccessibilityService.instance?.reloadModel()
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Languages (one = forced, several/none = auto-detect)")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
+                if (isChecked) cur.add(LANGS[which].second) else cur.remove(LANGS[which].second)
+            }
+            .setPositiveButton("Save") { _, _ -> persist(LANGS.map { it.second }.filter { it in cur }) }
+            .setNeutralButton("Auto-detect") { _, _ -> persist(emptyList()) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Rebuild the model list: installed models under "Local models" (hidden when
+     *  none), then not-yet-installed catalog entries under "Suggested models",
+     *  then the Browse button. Called on create, on resume, and after selection. */
+    private fun rebuildModelSections() {
+        modelContainer.removeAllViews()
+        modelRows.clear()
+        // Reflect downloads running in the background service.
+        inProgress.clear(); inProgress.addAll(DownloadCenter.active())
+
+        val installed = ModelDownloader.installedModels(this)
+        if (installed.isNotEmpty()) {
+            modelContainer.addView(sectionHeader("Local models"))
+            for (a in installed) {
+                val model = displayModel(a)
+                modelContainer.addView(swipeToDelete(buildModelRow(model)) { confirmDelete(model) })
+            }
+        }
+
+        val suggested = MODEL_CATALOG.filter { it.archive !in installed }
+        if (suggested.isNotEmpty()) {
+            modelContainer.addView(sectionHeader("Suggested models"))
+            for (m in suggested) modelContainer.addView(buildModelRow(m))
+        }
+
+        modelContainer.addView(com.google.android.material.button.MaterialButton(this).apply {
+            text = "Browse all models…"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, ModelBrowserActivity::class.java))
+            }
+            layoutParams = LinearLayout.LayoutParams(LP_WRAP, LP_WRAP).apply {
+                leftMargin = dp(24); topMargin = dp(8); bottomMargin = dp(4)
+            }
         })
 
-        Thread {
-            val result = HuggingFaceModelBrowser.fetchModels(showLargeModels)
-            runOnUiThread {
-                container.removeAllViews()
-                when (result) {
-                    is HuggingFaceModelBrowser.BrowseResult.Error -> {
-                        container.addView(TextView(this).apply {
-                            text = "Failed to load: ${result.message}"
-                            textSize = 14f
-                            setPadding(dp(24), dp(8), dp(24), dp(8))
-                            setTextColor(Color.RED)
-                        })
-                    }
-                    is HuggingFaceModelBrowser.BrowseResult.Success -> {
-                        hfModels = result.models
-                        if (hfModels.isEmpty()) {
-                            container.addView(TextView(this).apply {
-                                text = "No phone-suitable models found."
-                                textSize = 14f
-                                setPadding(dp(24), dp(8), dp(24), dp(8))
-                            })
-                        } else {
-                            container.addView(sectionHeader("Multilingual models (from HuggingFace)"))
-                            for (hf in hfModels) {
-                                val model = HuggingFaceModelBrowser.toModel(hf)
-                                container.addView(buildModelRow(model, hfModelRows))
-                            }
-                        }
-                    }
-                }
-            }
-        }.start()
+        // Reconnect to any downloads still running in the service so rows update live.
+        inProgress.forEach { a ->
+            observeDownload(a, MODEL_CATALOG.firstOrNull { it.archive == a }?.name ?: a)
+        }
     }
+
+    /**
+     * Wrap a row so swiping it left reveals a Delete button behind it. Horizontal
+     * drags are disambiguated from the ScrollView's vertical scroll; a tap still
+     * activates the row (select), and a tap while open just closes it.
+     */
+    private fun swipeToDelete(rowContent: View, onDelete: () -> Unit): View {
+        val revealPx = dp(96)
+        val container = FrameLayout(this)
+        container.addView(TextView(this).apply {
+            text = "Delete"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#D32F2F"))
+            layoutParams = FrameLayout.LayoutParams(revealPx, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.END)
+            setOnClickListener { onDelete() }
+        })
+        // Opaque background so the Delete button only shows once swiped open.
+        rowContent.setBackgroundColor(attrColor(android.R.attr.colorBackground))
+        container.addView(rowContent, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        var downX = 0f; var downY = 0f; var startTx = 0f
+        var dragging = false; var opened = false
+        rowContent.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    // Use raw (screen) coordinates: translating v would move e.x's
+                    // frame and cause the row to jitter as it follows the finger.
+                    downX = e.rawX; downY = e.rawY; startTx = v.translationX; dragging = false; false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = e.rawX - downX; val dy = e.rawY - downY
+                    if (!dragging && abs(dx) > slop && abs(dx) > abs(dy)) {
+                        dragging = true
+                        v.parent.requestDisallowInterceptTouchEvent(true)
+                    }
+                    if (dragging) {
+                        v.translationX = (startTx + dx).coerceIn(-revealPx.toFloat(), 0f)
+                        true
+                    } else false
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (dragging) {
+                        opened = v.translationX < -revealPx / 2f
+                        v.animate().translationX(if (opened) -revealPx.toFloat() else 0f)
+                            .setDuration(150).start()
+                        true
+                    } else if (abs(e.rawX - downX) < slop && abs(e.rawY - downY) < slop) {
+                        if (opened) {
+                            v.animate().translationX(0f).setDuration(150).start(); opened = false
+                        } else v.performClick()
+                        true
+                    } else false
+                }
+                else -> false
+            }
+        }
+        return container
+    }
+
+    private fun confirmDelete(model: Model) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Delete ${model.name}?")
+            .setMessage("This removes the downloaded model files (${model.sizeMb} MB).")
+            .setPositiveButton("Delete") { _, _ ->
+                ModelDownloader.delete(this, model)
+                if (prefs().getString("model_name", "") == model.archive) {
+                    prefs().edit().remove("model_name").apply()
+                    WhisperAccessibilityService.instance?.reloadModel()
+                }
+                rebuildModelSections(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** A Model for display of an installed archive: the catalog entry if known,
+     *  else a synthesized one (name/arch/size derived from the model dir). */
+    private fun displayModel(archive: String): Model {
+        MODEL_CATALOG.firstOrNull { it.archive == archive }?.let { return it }
+        val arch = LocalTranscriber.archOf(this, archive)
+        val mb = (dirSizeBytes(File(filesDir, "models/$archive")) / (1024 * 1024)).toInt()
+        return Model(archive.removePrefix("sherpa-onnx-"), archive, mb.coerceAtLeast(1), arch.label, arch = arch)
+    }
+
+    private fun dirSizeBytes(dir: File): Long =
+        dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
 
     /** Build a model row for any model, storing views in the provided map. */
     private fun buildModelRow(model: Model, rowMap: MutableMap<String, ModelRowViews> = modelRows): View {
@@ -279,43 +429,48 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onModelAction(model: Model) {
-        val views = modelRows[model.archive] ?: hfModelRows[model.archive] ?: return
-
         if (ModelDownloader.isInstalled(this, model)) {
             selectModel(model.archive)
             return
         }
-
-        views.dlBtn.isEnabled = false
-        views.progress.visibility = View.VISIBLE
-        views.progress.isIndeterminate = false
-        views.subtitle.text = "Starting download..."
         inProgress.add(model.archive)
+        modelRows[model.archive]?.let {
+            it.dlBtn.isEnabled = false
+            it.progress.visibility = View.VISIBLE
+            it.progress.isIndeterminate = true
+            it.subtitle.text = "Starting download…"
+        }
+        observeDownload(model.archive, model.name)
+        DownloadCenter.start(this, model) // foreground service; survives screen-off
+    }
 
-        ModelDownloader.download(this, model) { state ->
-            runOnUiThread {
-                when (state) {
-                    is DownloadState.Downloading -> {
-                        views.progress.progress = (state.progress * 100).toInt()
-                        views.subtitle.text = "Downloading: ${(state.progress * 100).toInt()}%"
-                    }
-                    is DownloadState.Extracting -> {
-                        views.progress.isIndeterminate = true
-                        views.subtitle.text = "Extracting..."
-                    }
-                    is DownloadState.Done -> {
-                        inProgress.remove(model.archive)
-                        views.progress.visibility = View.GONE
-                        selectModel(model.archive)
-                        toast("${model.name} ready!")
-                    }
-                    is DownloadState.Error -> {
-                        inProgress.remove(model.archive)
-                        views.progress.visibility = View.GONE
-                        views.subtitle.text = "Error: ${state.message}"
-                        views.dlBtn.isEnabled = true
-                    }
-                }
+    private fun observeDownload(archive: String, name: String) {
+        DownloadCenter.observe(archive) { state -> runOnUiThread { onDownloadState(archive, name, state) } }
+    }
+
+    private fun onDownloadState(archive: String, name: String, state: DownloadState) {
+        val views = modelRows[archive]
+        when (state) {
+            is DownloadState.Downloading -> {
+                views?.progress?.visibility = View.VISIBLE
+                views?.progress?.isIndeterminate = false
+                views?.progress?.progress = (state.progress * 100).toInt()
+                views?.subtitle?.text = "Downloading ${(state.progress * 100).toInt()}%"
+            }
+            is DownloadState.Extracting -> {
+                views?.progress?.isIndeterminate = true
+                views?.subtitle?.text = "Extracting…"
+            }
+            is DownloadState.Done -> {
+                inProgress.remove(archive)
+                toast("$name ready!")
+                selectModel(archive) // rebuilds sections (moves it into Local)
+            }
+            is DownloadState.Error -> {
+                inProgress.remove(archive)
+                views?.progress?.visibility = View.GONE
+                views?.subtitle?.text = "Error: ${state.message}"
+                views?.dlBtn?.isEnabled = true
             }
         }
     }
@@ -323,7 +478,7 @@ class MainActivity : AppCompatActivity() {
     private fun selectModel(archive: String) {
         prefs().edit().putString("model_name", archive).apply()
         WhisperAccessibilityService.instance?.reloadModel()
-        refreshAllCards(); refresh()
+        rebuildModelSections(); refresh()
     }
 
     private fun refreshCard(model: Model, rowMap: Map<String, ModelRowViews> = modelRows) {
@@ -351,7 +506,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshAllCards() {
         MODEL_CATALOG.forEach { refreshCard(it, modelRows) }
-        hfModels.forEach { hf -> refreshCard(HuggingFaceModelBrowser.toModel(hf), hfModelRows) }
     }
 
     // --- Prompt Rows ---
