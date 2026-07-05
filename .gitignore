@@ -8,6 +8,7 @@ local.properties
 *.jks
 *.keystore
 *.pass
+release*
 # Vendored sherpa-onnx native libs ARE tracked (see app/src/main/jniLibs/README.md).
 # Ignore everything else that lands here so stray/local .so files aren't committed.
 app/src/main/jniLibs/**
