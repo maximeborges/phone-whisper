@@ -38,6 +38,9 @@ class MainActivity : AppCompatActivity() {
     private var hfModels: List<HuggingFaceModelBrowser.HFModel> = emptyList()
     private val promptRows = mutableMapOf<String, PromptRowViews>()
 
+    /** Archives currently downloading or extracting — not yet usable. */
+    private val inProgress = mutableSetOf<String>()
+
     private data class ModelRowViews(
         val radio: MaterialRadioButton,
         val progress: LinearProgressIndicator,
@@ -234,6 +237,7 @@ class MainActivity : AppCompatActivity() {
             text = "↓"
             textSize = 18f
             setTextColor(attrColor(com.google.android.material.R.attr.colorPrimary))
+            setOnClickListener { onModelAction(model) }
         }
         
         val progress = LinearProgressIndicator(this).apply {
@@ -245,9 +249,14 @@ class MainActivity : AppCompatActivity() {
 
         val rightContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(dlBtn)
-            addView(radio)
+            gravity = Gravity.CENTER
+            val slot = dp(48)
+            addView(dlBtn, LinearLayout.LayoutParams(slot, slot).apply {
+                gravity = Gravity.CENTER
+            })
+            addView(radio, LinearLayout.LayoutParams(slot, slot).apply {
+                gravity = Gravity.CENTER
+            })
         }
 
         val row = settingsRow(
@@ -281,6 +290,7 @@ class MainActivity : AppCompatActivity() {
         views.progress.visibility = View.VISIBLE
         views.progress.isIndeterminate = false
         views.subtitle.text = "Starting download..."
+        inProgress.add(model.archive)
 
         ModelDownloader.download(this, model) { state ->
             runOnUiThread {
@@ -294,11 +304,13 @@ class MainActivity : AppCompatActivity() {
                         views.subtitle.text = "Extracting..."
                     }
                     is DownloadState.Done -> {
+                        inProgress.remove(model.archive)
                         views.progress.visibility = View.GONE
                         selectModel(model.archive)
                         toast("${model.name} ready!")
                     }
                     is DownloadState.Error -> {
+                        inProgress.remove(model.archive)
                         views.progress.visibility = View.GONE
                         views.subtitle.text = "Error: ${state.message}"
                         views.dlBtn.isEnabled = true
@@ -316,13 +328,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshCard(model: Model, rowMap: Map<String, ModelRowViews> = modelRows) {
         val views = rowMap[model.archive] ?: return
+
+        // Mid-download/extraction: keep showing progress, hide radio + button.
+        if (model.archive in inProgress) {
+            views.progress.visibility = View.VISIBLE
+            views.radio.visibility = View.GONE
+            views.dlBtn.visibility = View.GONE
+            return
+        }
+
         val active = prefs().getString("model_name", "") == model.archive
         val installed = ModelDownloader.isInstalled(this, model)
-        
+
         views.radio.isChecked = active
         views.radio.visibility = if (installed) View.VISIBLE else View.GONE
         views.dlBtn.visibility = if (installed) View.GONE else View.VISIBLE
-        
+
         if (views.progress.visibility == View.GONE) {
             views.subtitle.text = "${model.quality} · ${model.sizeMb} MB"
         }
