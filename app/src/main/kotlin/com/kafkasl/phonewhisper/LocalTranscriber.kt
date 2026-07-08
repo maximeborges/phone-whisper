@@ -146,11 +146,16 @@ class LocalTranscriber private constructor(private val recognizer: OfflineRecogn
                     encoder = onnx("encoder") ?: return null,
                     decoder = onnx("decoder") ?: return null,
                 )
-                ModelArch.TRANSDUCER -> m.transducer = OfflineTransducerModelConfig(
-                    encoder = onnx("encoder") ?: return null,
-                    decoder = onnx("decoder") ?: return null,
-                    joiner = onnx("joiner") ?: return null,
-                )
+                ModelArch.TRANSDUCER -> {
+                    m.transducer = OfflineTransducerModelConfig(
+                        encoder = onnx("encoder") ?: return null,
+                        decoder = onnx("decoder") ?: return null,
+                        joiner = onnx("joiner") ?: return null,
+                    )
+                    // Parakeet/NeMo TDT models must declare this; without it sherpa-onnx
+                    // loads them as a generic (icefall) transducer and crashes natively.
+                    m.modelType = "nemo_transducer"
+                }
                 ModelArch.MOONSHINE -> {
                     val preprocess = onnx("preprocess")
                     m.moonshine = if (preprocess != null) OfflineMoonshineModelConfig(

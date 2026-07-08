@@ -78,12 +78,30 @@ class WhisperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         instance = this
         showOverlay()
+        updateBubbleVisibility() // start hidden unless a keyboard is already up
         // Try to load local model in background
         thread { initLocalModel() }
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        when (event?.eventType) {
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> updateBubbleVisibility()
+        }
+    }
     override fun onInterrupt() {}
+
+    /** Show the bubble only when a keyboard is open (if the setting is on); always
+     *  show it while recording/transcribing so an in-progress dictation isn't lost. */
+    private fun updateBubbleVisibility() {
+        val keyboardOnly = prefs().getBoolean("bubble_keyboard_only", true)
+        val show = state != State.IDLE || !keyboardOnly || isKeyboardOpen()
+        handler.post { overlayView?.visibility = if (show) View.VISIBLE else View.GONE }
+    }
+
+    /** Called from settings when the bubble-visibility preference changes. */
+    fun refreshBubble() = updateBubbleVisibility()
 
     override fun onDestroy() {
         instance = null
@@ -140,6 +158,12 @@ class WhisperAccessibilityService : AccessibilityService() {
             prefs().edit().remove("model_loading").apply()
             Log.e(TAG, "Model load failed, will use API: ${e.message}", e)
             toast("Couldn't load model '$target': ${e.message}")
+        }
+
+        // Pre-warm the on-device cleanup model so the first cleanup isn't slow.
+        if (prefs().getBoolean("use_post_processing", false) &&
+            (prefs().getString("post_processing_mode", "cloud") ?: "cloud") == "local") {
+            LocalCleanup.prewarm(this)
         }
     }
 
@@ -468,41 +492,98 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
 
         val usePostProcessing = prefs().getBoolean("use_post_processing", false)
-        val apiKey = prefs().getString("api_key", "") ?: ""
+        val mode = prefs().getString("post_processing_mode", "cloud") ?: "cloud"
 
-        if (usePostProcessing) {
-            if (apiKey.isBlank()) {
-                handler.post {
-                    toast("Post-processing needs API key. Using raw text.")
-                    injectText(text)
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
-                return
-            }
-
-            val prompt = prefs().getString("post_processing_prompt", PostProcessor.DEFAULT_PROMPT) ?: PostProcessor.DEFAULT_PROMPT
-            
-            PostProcessor.process(text, prompt, apiKey) { result ->
-                handler.post {
-                    if (result.text != null && result.text.isNotBlank()) {
-                        injectText(result.text)
-                    } else {
-                        injectText(text, feedback = "Cleanup failed — raw copied to clipboard", feedbackDurationMs = 3000)
-                    }
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
-            }
-        } else {
+        // Inject the final text and return the overlay to idle (on the main thread).
+        fun finish(finalText: String, feedback: String? = "Copied to clipboard", durMs: Long = 2000) {
             handler.post {
-                injectText(text)
+                injectText(finalText, feedback = feedback, feedbackDurationMs = durMs)
                 state = State.IDLE
                 setBusy(false)
                 setAppearance(COLOR_IDLE)
             }
+        }
+
+        if (!usePostProcessing) {
+            finish(text)
+            return
+        }
+
+        val prompt = prefs().getString("post_processing_prompt", PostProcessor.DEFAULT_PROMPT)
+            ?: PostProcessor.DEFAULT_PROMPT
+        val failFeedback = "Cleanup failed — raw copied to clipboard"
+
+        if (mode == "local") {
+            if (!LocalCleanup.isReady(this)) {
+                handler.post { toast("Download the on-device cleanup model first. Using raw text.") }
+                finish(text)
+                return
+            }
+            // Use the user's custom prompt; fall back to the tuned on-device prompt
+            // when they're still on the big cloud default (which confuses a 1B model).
+            val cleanupPrompt =
+                if (prompt == PostProcessor.DEFAULT_PROMPT) LocalCleanup.DEFAULT_PROMPT else prompt
+            thread {
+                val cleaned = LocalCleanup.process(this, text, cleanupPrompt)
+                if (cleaned != null) {
+                    finish(cleaned)
+                } else {
+                    handler.post { toast("Cleanup model failed — inserting raw text") }
+                    finish(text, failFeedback, 3000)
+                }
+            }
+            return
+        }
+
+        if (mode == "claude") {
+            val key = prefs().getString("claude_key", "") ?: ""
+            if (key.isBlank()) {
+                handler.post { toast("Set the Claude API key first. Using raw text.") }
+                finish(text)
+                return
+            }
+            val model = (prefs().getString("claude_model", "") ?: "").ifBlank { "claude-haiku-4-5" }
+            PostProcessor.processClaude(text, prompt, key, model) { result ->
+                if (result.text != null && result.text.isNotBlank()) {
+                    finish(result.text)
+                } else {
+                    handler.post { toast("Claude cleanup failed: ${result.error ?: "no response"} — raw text") }
+                    finish(text, failFeedback, 3000)
+                }
+            }
+            return
+        }
+
+        if (mode == "server") {
+            val url = prefs().getString("server_url", "") ?: ""
+            if (url.isBlank()) {
+                handler.post { toast("Set the cleanup server URL first. Using raw text.") }
+                finish(text)
+                return
+            }
+            val model = (prefs().getString("server_model", "") ?: "").ifBlank { "qwen2.5:14b-instruct" }
+            val key = prefs().getString("server_key", "") ?: ""
+            PostProcessor.processRemote(text, prompt, url, model, key) { result ->
+                if (result.text != null && result.text.isNotBlank()) {
+                    finish(result.text)
+                } else {
+                    handler.post { toast("Server cleanup failed: ${result.error ?: "no response"} — raw text") }
+                    finish(text, failFeedback, 3000)
+                }
+            }
+            return
+        }
+
+        // Cloud (OpenAI) post-processing.
+        val apiKey = prefs().getString("api_key", "") ?: ""
+        if (apiKey.isBlank()) {
+            handler.post { toast("Post-processing needs API key. Using raw text.") }
+            finish(text)
+            return
+        }
+        PostProcessor.process(text, prompt, apiKey) { result ->
+            if (result.text != null && result.text.isNotBlank()) finish(result.text)
+            else finish(text, failFeedback, 3000)
         }
     }
 

@@ -15,6 +15,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.concurrent.thread
 
 /**
  * Process-wide registry of in-flight downloads. The UI observes states here; the
@@ -30,6 +31,14 @@ object DownloadCenter {
         if (isActive(model.archive)) return
         states[model.archive] = DownloadState.Downloading(0f)
         ContextCompat.startForegroundService(ctx.applicationContext, DownloadService.intent(ctx, model))
+    }
+
+    /** Start a foreground download of an on-device cleanup model. */
+    fun startCleanup(ctx: Context, modelId: String, hfToken: String) {
+        val key = ModelDownloader.cleanupProgressId(modelId)
+        if (isActive(key)) return
+        states[key] = DownloadState.Downloading(0f)
+        ContextCompat.startForegroundService(ctx.applicationContext, DownloadService.cleanupIntent(ctx, modelId, hfToken))
     }
 
     /** Register a listener and immediately deliver the current state, if any. */
@@ -71,6 +80,10 @@ class DownloadService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.getStringExtra("kind") == "cleanup") {
+            startCleanupJob(intent.getStringExtra("cleanupId") ?: "", intent.getStringExtra("hfToken") ?: "")
+            return START_NOT_STICKY
+        }
         val model = modelFrom(intent)
         if (model == null) { stopIfIdle(); return START_NOT_STICKY }
         lastTitle = model.name
@@ -94,6 +107,32 @@ class DownloadService : Service() {
             }
         }
         return START_NOT_STICKY
+    }
+
+    private fun startCleanupJob(modelId: String, hfToken: String) {
+        val model = ModelDownloader.cleanupModelById(modelId)
+        if (model == null) { stopIfIdle(); return }
+        val key = ModelDownloader.cleanupProgressId(modelId)
+        val title = "Cleanup model: ${model.label}"
+        lastTitle = title
+        ServiceCompat.startForeground(
+            this, NOTIF_ID, notif(title, "Starting…", 0, true),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+        )
+        if (!active.add(key)) return
+        acquireWakeLock()
+        thread {
+            ModelDownloader.downloadCleanupModel(this, model, hfToken) { state ->
+                DownloadCenter.report(key, state)
+                when (state) {
+                    is DownloadState.Downloading ->
+                        update(title, "Downloading ${(state.progress * 100).toInt()}%",
+                            (state.progress * 100).toInt(), false)
+                    is DownloadState.Extracting -> {}
+                    is DownloadState.Done, is DownloadState.Error -> finish(key)
+                }
+            }
+        }
     }
 
     private fun finish(archive: String) {
@@ -149,6 +188,13 @@ class DownloadService : Service() {
     companion object {
         private const val CHANNEL = "downloads"
         private const val NOTIF_ID = 4711
+
+        fun cleanupIntent(ctx: Context, modelId: String, hfToken: String): Intent =
+            Intent(ctx, DownloadService::class.java).apply {
+                putExtra("kind", "cleanup")
+                putExtra("cleanupId", modelId)
+                putExtra("hfToken", hfToken)
+            }
 
         fun intent(ctx: Context, m: Model): Intent =
             Intent(ctx, DownloadService::class.java).apply {

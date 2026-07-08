@@ -46,7 +46,7 @@ val MODEL_CATALOG = listOf(
         153, "★★★ · English", hfRepo = "csukuangfj/sherpa-onnx-whisper-base.en",
         arch = ModelArch.WHISPER),
     Model("Parakeet 0.6B", "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
-        639, "★★★★ Best quality · large",
+        639, "★★★★ Multilingual · auto · best quality",
         hfRepo = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
         arch = ModelArch.TRANSDUCER),
     Model("Moonshine Tiny", "sherpa-onnx-moonshine-tiny-en-int8",
@@ -73,6 +73,112 @@ object ModelDownloader {
 
     fun modelDir(ctx: Context, model: Model) =
         File(ctx.filesDir, "models/${model.archive}")
+
+    // --- On-device cleanup models (MediaPipe LLM Inference .task) ---
+
+    /** A selectable on-device cleanup LLM. [gated] models need an HF token. */
+    data class CleanupModel(
+        val id: String,
+        val label: String,
+        val url: String,
+        val sizeMb: Int,
+        val gated: Boolean,
+        /** Chat-template family — each family uses different turn tokens. */
+        val family: String,
+    )
+
+    val CLEANUP_MODELS = listOf(
+        CleanupModel("gemma3-1b-q4", "Gemma-3 1B · fastest",
+            "https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/Gemma3-1B-IT_multi-prefill-seq_q4_ekv2048.task",
+            528, gated = true, family = "gemma"),
+        CleanupModel("gemma3-1b-q8", "Gemma-3 1B · q8",
+            "https://huggingface.co/litert-community/Gemma3-1B-IT/resolve/main/Gemma3-1B-IT_multi-prefill-seq_q8_ekv1280.task",
+            1005, gated = true, family = "gemma"),
+        CleanupModel("qwen2.5-1.5b-q8", "Qwen2.5 1.5B · multilingual (no token)",
+            "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv1280.task",
+            1523, gated = false, family = "qwen"),
+        CleanupModel("gemma3-4b-int4", "Gemma-3 4B · best quality",
+            "https://huggingface.co/litert-community/Gemma3-4B-IT/resolve/main/gemma3-4b-it-int4-web.task",
+            2440, gated = true, family = "gemma"),
+    )
+
+    private const val DEFAULT_CLEANUP_ID = "gemma3-1b-q4"
+
+    fun cleanupModelById(id: String?) = CLEANUP_MODELS.firstOrNull { it.id == id }
+    fun selectedCleanupId(ctx: Context) =
+        prefsOf(ctx).getString("cleanup_model_id", DEFAULT_CLEANUP_ID) ?: DEFAULT_CLEANUP_ID
+
+    private fun prefsOf(ctx: Context) = ctx.getSharedPreferences("phonewhisper", Context.MODE_PRIVATE)
+    private fun cleanupFile(ctx: Context, id: String) = File(ctx.filesDir, "cleanup/$id.task")
+    private fun cleanupMarker(ctx: Context, id: String) = File(ctx.filesDir, "cleanup/$id.downloading")
+
+    /** Progress key for [DownloadCenter] for a given cleanup model. */
+    fun cleanupProgressId(id: String) = "cleanup:$id"
+
+    /** File for the currently-selected cleanup model. */
+    fun cleanupModelFile(ctx: Context) = cleanupFile(ctx, selectedCleanupId(ctx))
+
+    fun isCleanupInstalled(ctx: Context, id: String = selectedCleanupId(ctx)): Boolean =
+        cleanupFile(ctx, id).exists() && !cleanupMarker(ctx, id).exists()
+
+    fun deleteCleanupModel(ctx: Context, id: String) {
+        cleanupFile(ctx, id).delete()
+        cleanupMarker(ctx, id).delete()
+    }
+
+    /** Download a cleanup model (auth header when gated). Blocking — run off the
+     *  main thread (the DownloadService runs it in the foreground). */
+    fun downloadCleanupModel(
+        ctx: Context, model: CleanupModel, hfToken: String, onState: (DownloadState) -> Unit,
+    ) {
+        val dest = cleanupFile(ctx, model.id)
+        val marker = cleanupMarker(ctx, model.id)
+        try {
+            dest.parentFile?.mkdirs()
+            // Fail early (and clearly) if there isn't room — a partial file would
+            // otherwise look "installed" but be a corrupt zip the engine can't open.
+            val needBytes = model.sizeMb.toLong() * 1024 * 1024 + 200L * 1024 * 1024
+            val free = ctx.filesDir.usableSpace
+            if (free < needBytes) {
+                throw IOException("Not enough storage: need ~${model.sizeMb + 200} MB, " +
+                    "only ${free / 1024 / 1024} MB free. Free up space and retry.")
+            }
+            marker.writeText("1")
+            val req = Request.Builder().url(model.url).apply {
+                if (model.gated) header("Authorization", "Bearer $hfToken")
+            }.build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val hint = if (resp.code == 401 || resp.code == 403)
+                        " — accept the model's license on HuggingFace and use a valid read token" else ""
+                    throw IOException("HTTP ${resp.code}$hint")
+                }
+                val body = resp.body ?: throw IOException("Empty response")
+                val total = body.contentLength()
+                var done = 0L
+                body.byteStream().use { src ->
+                    BufferedOutputStream(FileOutputStream(dest)).use { dst ->
+                        val buf = ByteArray(1 shl 16)
+                        var n: Int
+                        while (src.read(buf).also { n = it } != -1) {
+                            dst.write(buf, 0, n)
+                            done += n
+                            if (total > 0) onState(DownloadState.Downloading(done.toFloat() / total))
+                        }
+                    }
+                }
+                if (total > 0 && dest.length() != total) {
+                    throw IOException("truncated: ${dest.length()} of $total bytes")
+                }
+            }
+            marker.delete() // mark complete
+            onState(DownloadState.Done)
+        } catch (e: Exception) {
+            dest.delete()
+            marker.delete()
+            onState(DownloadState.Error(e.message ?: "download failed"))
+        }
+    }
 
     /** A model counts as installed only once the [LocalTranscriber.ARCH_MARKER] is
      *  present — it is written last, after every file has fully downloaded and
@@ -126,6 +232,13 @@ object ModelDownloader {
 
         Thread {
             try {
+                // Fail early if there isn't room — a partial extraction/download would
+                // otherwise land a corrupt onnx that crashes onnxruntime natively.
+                val needBytes = model.sizeMb.toLong() * 1024 * 1024 + 300L * 1024 * 1024
+                if (ctx.filesDir.usableSpace < needBytes) {
+                    throw IOException("Not enough storage: need ~${model.sizeMb + 300} MB, " +
+                        "only ${ctx.filesDir.usableSpace / 1024 / 1024} MB free. Free up space and retry.")
+                }
                 val repo = model.hfRepo ?: "csukuangfj/${model.archive}"
                 val viaHf = try {
                     downloadFromHf(repo, model, outDir, onState)
@@ -259,9 +372,11 @@ object ModelDownloader {
         repeat(2) { attempt ->
             var written = 0L
             try {
+                var contentLen = -1L
                 client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
                     if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
                     val body = resp.body ?: throw IOException("Empty response")
+                    contentLen = body.contentLength()
                     body.byteStream().use { src ->
                         BufferedOutputStream(FileOutputStream(dest)).use { dst ->
                             val buf = ByteArray(1 shl 16)
@@ -274,8 +389,11 @@ object ModelDownloader {
                         }
                     }
                 }
-                if (expectedSize > 0 && dest.length() != expectedSize) {
-                    throw IOException("truncated ${dest.name}: got ${dest.length()} of $expectedSize bytes")
+                // Prefer the API-reported size; fall back to the HTTP Content-Length
+                // so a missing/zero listing size can't let a truncated file through.
+                val expected = if (expectedSize > 0) expectedSize else contentLen
+                if (expected > 0 && dest.length() != expected) {
+                    throw IOException("truncated ${dest.name}: got ${dest.length()} of $expected bytes")
                 }
                 return
             } catch (e: Exception) {
@@ -322,6 +440,12 @@ object ModelDownloader {
                 }
             }
         }
+        // A CDN closing the connection early reads as a clean EOF; without this
+        // check a truncated .tar.bz2 would extract a corrupt onnx that crashes
+        // onnxruntime natively ("No graph in protobuf").
+        if (total > 0 && dest.length() != total) {
+            throw IOException("truncated download: ${dest.length()} of $total bytes")
+        }
     }
 
     /** Extract tar.bz2 to outDir. Validates paths to prevent traversal. */
@@ -337,7 +461,12 @@ object ModelDownloader {
                 if (entry.isDirectory) dest.mkdirs()
                 else {
                     dest.parentFile?.mkdirs()
-                    FileOutputStream(dest).use { tar.copyTo(it) }
+                    val written = FileOutputStream(dest).use { tar.copyTo(it) }
+                    // Guard against a truncated archive / full disk leaving a short
+                    // file that later crashes onnxruntime ("No graph in protobuf").
+                    if (entry.size >= 0 && written != entry.size) {
+                        throw IOException("truncated ${entry.name}: $written of ${entry.size} bytes")
+                    }
                 }
             }
         }

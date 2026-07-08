@@ -40,6 +40,15 @@ class MainActivity : AppCompatActivity() {
     private val promptRows = mutableMapOf<String, PromptRowViews>()
     private var langRowView: LinearLayout? = null
 
+    // On-device cleanup (Post-Processing) UI
+    private var cleanupModeRow: LinearLayout? = null
+    private var cleanupContainer: LinearLayout? = null
+    private var cleanupListContainer: LinearLayout? = null
+    private var serverContainer: LinearLayout? = null
+    private var claudeContainer: LinearLayout? = null
+    private val cleanupRows = mutableMapOf<String, ModelRowViews>()
+    private var hfTokenSub: TextView? = null
+
     /** Archives currently downloading or extracting — not yet usable. */
     private val inProgress = mutableSetOf<String>()
 
@@ -135,6 +144,22 @@ class MainActivity : AppCompatActivity() {
             avoidClipSwitch.isChecked = v
         })
 
+        // Show the floating bubble only when a keyboard is open.
+        val bubbleSwitch = MaterialSwitch(this).apply {
+            isChecked = prefs().getBoolean("bubble_keyboard_only", true)
+            isClickable = false
+        }
+        root.addView(settingsRow(
+            "Show bubble only with keyboard",
+            "Hide the dictation bubble unless a text field is focused",
+            bubbleSwitch,
+        ) {
+            val v = !bubbleSwitch.isChecked
+            prefs().edit().putBoolean("bubble_keyboard_only", v).apply()
+            bubbleSwitch.isChecked = v
+            WhisperAccessibilityService.instance?.refreshBubble()
+        })
+
         // Models: "Local models" (installed) + "Suggested models" + Browse button.
         modelContainer = vertical(0)
         root.addView(modelContainer)
@@ -148,13 +173,56 @@ class MainActivity : AppCompatActivity() {
             isChecked = isPostProcessing
             isClickable = false
         }
-        val postProcessRow = settingsRow("Cleanup transcript", "Uses OpenAI Chat API to fix grammar and punctuation", postProcessSwitch) {
+        val postProcessRow = settingsRow("Cleanup transcript", "Fix grammar, punctuation & typos — cloud or on-device", postProcessSwitch) {
             val newVal = !postProcessSwitch.isChecked
             prefs().edit().putBoolean("use_post_processing", newVal).apply()
             postProcessSwitch.isChecked = newVal
             refresh()
         }
         root.addView(postProcessRow)
+
+        // Cleanup engine: cloud vs on-device.
+        val modeRow = settingsRow("Cleanup engine", cleanupModeLabel()) { showCleanupModePicker() }
+        cleanupModeRow = modeRow
+        root.addView(modeRow)
+
+        // On-device model management (shown only when engine = On-device).
+        val cc = vertical(0)
+        val hfRow = settingsRow("HuggingFace token", hfTokenSummary()) { promptHfToken() }
+        hfTokenSub = hfRow.findViewWithTag("subtitle")
+        cc.addView(hfRow)
+        cc.addView(sectionHeader("Cleanup model"))
+        val list = vertical(0)
+        cleanupListContainer = list
+        cc.addView(list)
+        cleanupContainer = cc
+        root.addView(cc)
+        rebuildCleanupList()
+
+        // Self-hosted server settings (shown only when engine = Self-hosted).
+        val sc = vertical(0)
+        val urlRow = settingsRow("Server URL", serverUrlSummary()) { promptServerUrl() }
+        urlRow.tag = "serverUrlRow"
+        sc.addView(urlRow)
+        val srvModelRow = settingsRow("Model", serverModelSummary()) { promptServerModel() }
+        srvModelRow.tag = "serverModelRow"
+        sc.addView(srvModelRow)
+        val srvKeyRow = settingsRow("API key (optional)", serverKeySummary()) { promptServerKey() }
+        srvKeyRow.tag = "serverKeyRow"
+        sc.addView(srvKeyRow)
+        serverContainer = sc
+        root.addView(sc)
+
+        // Claude (Anthropic) settings (shown only when engine = Cloud (Claude)).
+        val cl = vertical(0)
+        val claudeKeyRow = settingsRow("Claude API key", claudeKeySummary()) { promptClaudeKey() }
+        claudeKeyRow.tag = "claudeKeyRow"
+        cl.addView(claudeKeyRow)
+        val claudeModelRow = settingsRow("Model", claudeModelSummary()) { promptClaudeModel() }
+        claudeModelRow.tag = "claudeModelRow"
+        cl.addView(claudeModelRow)
+        claudeContainer = cl
+        root.addView(cl)
 
         promptContainer = vertical(0)
         for (preset in promptPresets()) promptContainer.addView(buildPromptRow(preset))
@@ -189,6 +257,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         // Reflect models installed/removed elsewhere (e.g. the browser).
         if (::modelContainer.isInitialized) rebuildModelSections()
+        if (cleanupListContainer != null) rebuildCleanupList()
         refresh()
     }
     override fun onRequestPermissionsResult(c: Int, p: Array<String>, r: IntArray) {
@@ -547,6 +616,302 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshPromptRows() = promptPresets().forEach { refreshPromptRow(it) }
 
+    // --- On-device cleanup (Post-Processing engine) ---
+
+    private fun postMode() = prefs().getString("post_processing_mode", "cloud") ?: "cloud"
+    private fun cleanupModeLabel() = when (postMode()) {
+        "local" -> "On-device (Gemma-3 1B)"
+        "server" -> "Self-hosted (Ollama)"
+        "claude" -> "Cloud (Claude)"
+        else -> "Cloud (OpenAI)"
+    }
+
+    private fun showCleanupModePicker() {
+        val opts = listOf(
+            "Cloud (Claude)" to "claude",
+            "Cloud (OpenAI)" to "cloud",
+            "On-device (Gemma-3 1B)" to "local",
+            "Self-hosted (Ollama)" to "server",
+        )
+        val cur = opts.indexOfFirst { it.second == postMode() }.coerceAtLeast(0)
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Cleanup engine")
+            .setSingleChoiceItems(opts.map { it.first }.toTypedArray(), cur) { d, w ->
+                prefs().edit().putString("post_processing_mode", opts[w].second).apply()
+                d.dismiss(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun hfTokenSummary() =
+        if ((prefs().getString("hf_token", "") ?: "").isBlank())
+            "Only for gated models (Gemma). Tap to set." else "Set ✓"
+
+    private fun promptHfToken() {
+        val input = EditText(this).apply {
+            hint = "hf_..."
+            setText(prefs().getString("hf_token", ""))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("HuggingFace token")
+            .setMessage("Accept the Gemma license at huggingface.co/litert-community/Gemma3-1B-IT, then paste a read token.")
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save") { _, _ ->
+                prefs().edit().putString("hf_token", input.text.toString().trim()).apply(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // --- Self-hosted (Ollama) cleanup server ---
+
+    private fun serverUrlSummary() =
+        (prefs().getString("server_url", "") ?: "").ifBlank { "e.g. http://192.168.1.50:11434" }
+    private fun serverModelSummary() =
+        (prefs().getString("server_model", "") ?: "").ifBlank { "qwen2.5:14b-instruct" }
+    private fun serverKeySummary() =
+        if ((prefs().getString("server_key", "") ?: "").isBlank()) "None (bare Ollama needs none)" else "Set ✓"
+
+    private fun promptServerUrl() {
+        val input = EditText(this).apply {
+            hint = "http://192.168.1.50:11434"
+            inputType = android.text.InputType.TYPE_TEXT_VARIATION_URI
+            setText(prefs().getString("server_url", ""))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Cleanup server URL")
+            .setMessage("Base URL of your OpenAI-compatible server (Ollama, llama.cpp, LM Studio). " +
+                "Run Ollama with OLLAMA_HOST=0.0.0.0 so the phone can reach it on your LAN.")
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save") { _, _ ->
+                prefs().edit().putString("server_url", input.text.toString().trim()).apply(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun promptServerModel() {
+        val input = EditText(this).apply {
+            hint = "qwen2.5:14b-instruct"
+            setText(prefs().getString("server_model", ""))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Model name")
+            .setMessage("The model tag as your server names it, e.g. qwen2.5:14b-instruct, " +
+                "gemma3:27b, or llama3.1:8b.")
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save") { _, _ ->
+                prefs().edit().putString("server_model", input.text.toString().trim()).apply(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun promptServerKey() {
+        val input = EditText(this).apply {
+            hint = "leave empty for bare Ollama"
+            setText(prefs().getString("server_key", ""))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("API key (optional)")
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save") { _, _ ->
+                prefs().edit().putString("server_key", input.text.toString().trim()).apply(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // --- Claude (Anthropic) cleanup ---
+
+    private fun claudeKeySummary(): String {
+        val k = prefs().getString("claude_key", "") ?: ""
+        return if (k.isBlank()) "Tap to set" else if (k.length > 8) "sk-ant-...${k.takeLast(4)}" else "Set ✓"
+    }
+    private fun claudeModelSummary() =
+        (prefs().getString("claude_model", "") ?: "").ifBlank { "claude-haiku-4-5" }
+
+    private fun promptClaudeKey() {
+        val input = EditText(this).apply {
+            hint = "sk-ant-..."
+            setText(prefs().getString("claude_key", ""))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Claude API key")
+            .setMessage("An Anthropic API key from console.anthropic.com.")
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save") { _, _ ->
+                prefs().edit().putString("claude_key", input.text.toString().trim()).apply(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun promptClaudeModel() {
+        val input = EditText(this).apply {
+            hint = "claude-haiku-4-5"
+            setText(prefs().getString("claude_model", ""))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Model name")
+            .setMessage("Anthropic model id, e.g. claude-haiku-4-5 (fast/cheap) or " +
+                "claude-sonnet-4-6 (stronger).")
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save") { _, _ ->
+                prefs().edit().putString("claude_model", input.text.toString().trim()).apply(); refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun rebuildCleanupList() {
+        val list = cleanupListContainer ?: return
+        list.removeAllViews()
+        cleanupRows.clear()
+        for (m in ModelDownloader.CLEANUP_MODELS) {
+            val row = buildCleanupRow(m)
+            list.addView(
+                if (ModelDownloader.isCleanupInstalled(this, m.id)) swipeToDelete(row) { confirmDeleteCleanup(m) }
+                else row
+            )
+        }
+        // Reconnect to any in-flight cleanup downloads.
+        ModelDownloader.CLEANUP_MODELS
+            .filter { DownloadCenter.isActive(ModelDownloader.cleanupProgressId(it.id)) }
+            .forEach { observeCleanupRow(it) }
+    }
+
+    private fun cleanupRowSubtitle(m: ModelDownloader.CleanupModel): String {
+        val active = ModelDownloader.selectedCleanupId(this) == m.id
+        return when {
+            ModelDownloader.isCleanupInstalled(this, m.id) ->
+                "${m.sizeMb} MB · installed${if (active) " · active" else ""}"
+            DownloadCenter.isActive(ModelDownloader.cleanupProgressId(m.id)) -> "downloading…"
+            else -> "${m.sizeMb} MB${if (m.gated) " · needs HF token" else " · no token"}"
+        }
+    }
+
+    private fun buildCleanupRow(m: ModelDownloader.CleanupModel): View {
+        val radio = MaterialRadioButton(this).apply {
+            isClickable = false
+            buttonTintList = ColorStateList.valueOf(attrColor(com.google.android.material.R.attr.colorPrimary))
+        }
+        val dlBtn = MaterialButton(this, null, com.google.android.material.R.attr.materialIconButtonStyle).apply {
+            text = "↓"; textSize = 18f
+            setTextColor(attrColor(com.google.android.material.R.attr.colorPrimary))
+            setOnClickListener { onCleanupRowTap(m) }
+        }
+        val progress = LinearProgressIndicator(this).apply {
+            visibility = View.GONE; isIndeterminate = false
+            layoutParams = LinearLayout.LayoutParams(LP_MATCH, dp(4)).apply { topMargin = dp(8) }
+        }
+        val right = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER
+            val slot = dp(48)
+            addView(dlBtn, LinearLayout.LayoutParams(slot, slot))
+            addView(radio, LinearLayout.LayoutParams(slot, slot))
+        }
+        val row = settingsRow(m.label, cleanupRowSubtitle(m), right) { onCleanupRowTap(m) }
+        (row.getChildAt(0) as LinearLayout).addView(progress)
+        cleanupRows[m.id] = ModelRowViews(radio, progress, row.findViewWithTag("subtitle"), dlBtn)
+        refreshCleanupRow(m)
+        return row
+    }
+
+    private fun refreshCleanupRow(m: ModelDownloader.CleanupModel) {
+        val v = cleanupRows[m.id] ?: return
+        if (DownloadCenter.isActive(ModelDownloader.cleanupProgressId(m.id))) {
+            v.progress.visibility = View.VISIBLE; v.radio.visibility = View.GONE; v.dlBtn.visibility = View.GONE
+            return
+        }
+        val installed = ModelDownloader.isCleanupInstalled(this, m.id)
+        v.radio.isChecked = installed && ModelDownloader.selectedCleanupId(this) == m.id
+        v.radio.visibility = if (installed) View.VISIBLE else View.GONE
+        v.dlBtn.visibility = if (installed) View.GONE else View.VISIBLE
+        if (v.progress.visibility == View.GONE) v.subtitle.text = cleanupRowSubtitle(m)
+    }
+
+    /** Tap a cleanup model row: switch to it if installed, else download it. */
+    private fun onCleanupRowTap(m: ModelDownloader.CleanupModel) {
+        if (ModelDownloader.isCleanupInstalled(this, m.id)) {
+            prefs().edit().putString("cleanup_model_id", m.id).apply()
+            LocalCleanup.close(); LocalCleanup.prewarm(this)
+            toast("Using ${m.label}")
+            rebuildCleanupList()
+            return
+        }
+        if (m.gated && (prefs().getString("hf_token", "") ?: "").isBlank()) {
+            toast("Set a HuggingFace token first (needed for ${m.label})"); return
+        }
+        prefs().edit().putString("cleanup_model_id", m.id).apply() // make it active once ready
+        observeCleanupRow(m)
+        DownloadCenter.startCleanup(this, m.id, prefs().getString("hf_token", "") ?: "")
+        refreshCleanupRow(m)
+    }
+
+    private fun confirmDeleteCleanup(m: ModelDownloader.CleanupModel) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Delete ${m.label}?")
+            .setMessage("Removes the downloaded model (${m.sizeMb} MB).")
+            .setPositiveButton("Delete") { _, _ ->
+                ModelDownloader.deleteCleanupModel(this, m.id)
+                if (ModelDownloader.selectedCleanupId(this) == m.id) LocalCleanup.close()
+                rebuildCleanupList()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun observeCleanupRow(m: ModelDownloader.CleanupModel) {
+        DownloadCenter.observe(ModelDownloader.cleanupProgressId(m.id)) { state ->
+            runOnUiThread {
+                val v = cleanupRows[m.id]
+                when (state) {
+                    is DownloadState.Downloading -> {
+                        v?.progress?.visibility = View.VISIBLE
+                        v?.progress?.isIndeterminate = false
+                        v?.progress?.progress = (state.progress * 100).toInt()
+                        v?.subtitle?.text = "Downloading ${(state.progress * 100).toInt()}%"
+                    }
+                    is DownloadState.Extracting -> v?.progress?.isIndeterminate = true
+                    is DownloadState.Done -> {
+                        LocalCleanup.prewarm(this)
+                        toast("${m.label} ready")
+                        rebuildCleanupList()
+                    }
+                    is DownloadState.Error -> {
+                        v?.progress?.visibility = View.GONE
+                        val msg = state.message ?: ""
+                        v?.subtitle?.text = "Error: $msg"
+                        if (m.gated && ("403" in msg || "401" in msg)) showLicenseDialog(m)
+                        refreshCleanupRow(m)
+                    }
+                }
+            }
+        }
+    }
+
+    /** A gated model returned 403/401 — offer to open its HF page to accept the license. */
+    private fun showLicenseDialog(m: ModelDownloader.CleanupModel) {
+        val page = m.url.substringBefore("/resolve/")
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Accept the model license")
+            .setMessage("${m.label} is gated on HuggingFace. Open its page, click " +
+                "\"Agree and access repository\", then tap the model again to download.\n\n$page")
+            .setPositiveButton("Open page") { _, _ ->
+                runCatching { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(page))) }
+            }
+            .setNeutralButton("Copy link") { _, _ ->
+                val cb = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cb.setPrimaryClip(android.content.ClipData.newPlainText("hf", page))
+                toast("Link copied")
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+
     // --- State Updates ---
 
     private fun refresh() {
@@ -563,6 +928,30 @@ class MainActivity : AppCompatActivity() {
         modelContainer.visibility = if (useLocal) View.VISIBLE else View.GONE
         promptContainer.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
         promptRow.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
+
+        // Cleanup engine + on-device model management.
+        cleanupModeRow?.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
+        cleanupModeRow?.findViewWithTag<TextView>("subtitle")?.text = cleanupModeLabel()
+        cleanupContainer?.visibility =
+            if (usePostProcessing && postMode() == "local") View.VISIBLE else View.GONE
+        hfTokenSub?.text = hfTokenSummary()
+        if (cleanupRows.isNotEmpty()) ModelDownloader.CLEANUP_MODELS.forEach { refreshCleanupRow(it) }
+
+        serverContainer?.visibility =
+            if (usePostProcessing && postMode() == "server") View.VISIBLE else View.GONE
+        serverContainer?.findViewWithTag<LinearLayout>("serverUrlRow")
+            ?.findViewWithTag<TextView>("subtitle")?.text = serverUrlSummary()
+        serverContainer?.findViewWithTag<LinearLayout>("serverModelRow")
+            ?.findViewWithTag<TextView>("subtitle")?.text = serverModelSummary()
+        serverContainer?.findViewWithTag<LinearLayout>("serverKeyRow")
+            ?.findViewWithTag<TextView>("subtitle")?.text = serverKeySummary()
+
+        claudeContainer?.visibility =
+            if (usePostProcessing && postMode() == "claude") View.VISIBLE else View.GONE
+        claudeContainer?.findViewWithTag<LinearLayout>("claudeKeyRow")
+            ?.findViewWithTag<TextView>("subtitle")?.text = claudeKeySummary()
+        claudeContainer?.findViewWithTag<LinearLayout>("claudeModelRow")
+            ?.findViewWithTag<TextView>("subtitle")?.text = claudeModelSummary()
 
         val apiKey = prefs().getString("api_key", "") ?: ""
         keyRowSub.text = if (apiKey.isBlank()) "Tap to set" 
@@ -581,7 +970,8 @@ class MainActivity : AppCompatActivity() {
         // Ready logic
         val localReady = useLocal && hasModel
         val cloudReady = !useLocal && hasKey
-        val postReady = !usePostProcessing || hasKey
+        // Only Cloud post-processing needs the OpenAI key; local/self-hosted don't.
+        val postReady = !usePostProcessing || postMode() != "cloud" || hasKey
         val ready = audio && acc && (localReady || cloudReady) && postReady
 
         statusSubtitle.text = if (ready) "Ready — tap the overlay dot to dictate" else "Setup required"
