@@ -65,7 +65,10 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle
+
+      - name: Set up Gradle
+        if: steps.version.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Grant execute permission for gradlew
         if: steps.version.outputs.skip != 'true'
