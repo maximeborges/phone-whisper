@@ -87,17 +87,37 @@ class WhisperAccessibilityService : AccessibilityService() {
         when (event?.eventType) {
             AccessibilityEvent.TYPE_WINDOWS_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_FOCUSED -> updateBubbleVisibility()
+            AccessibilityEvent.TYPE_VIEW_FOCUSED,
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> updateBubbleVisibility()
         }
     }
     override fun onInterrupt() {}
 
-    /** Show the bubble only when a keyboard is open (if the setting is on); always
-     *  show it while recording/transcribing so an in-progress dictation isn't lost. */
+    /** Show the bubble only when an input field has input focus (if the setting is on);
+     *  always show it while recording/transcribing so an in-progress dictation isn't lost. */
     private fun updateBubbleVisibility() {
-        val keyboardOnly = prefs().getBoolean("bubble_keyboard_only", true)
-        val show = state != State.IDLE || !keyboardOnly || isKeyboardOpen()
+        val inputOnly = prefs().getBoolean("bubble_keyboard_only", true)
+        val show = state != State.IDLE || !inputOnly || hasFocusedInput()
         handler.post { overlayView?.visibility = if (show) View.VISIBLE else View.GONE }
+    }
+
+    /** True if any non-overlay window has a focused editable (text input) node. */
+    private fun hasFocusedInput(): Boolean {
+        val roots = buildList {
+            rootInActiveWindow?.let { add(it) }
+            windows?.forEach { w -> w.root?.let { add(it) } }
+        }
+        return try {
+            roots.any { root ->
+                val node = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return@any false
+                val cls = node.className?.toString().orEmpty()
+                val ok = node.isEditable || cls.contains("EditText") || cls.contains("TerminalView")
+                node.recycle()
+                ok
+            }
+        } finally {
+            roots.forEach { it.recycle() }
+        }
     }
 
     /** Called from settings when the bubble-visibility preference changes. */

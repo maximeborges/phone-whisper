@@ -144,14 +144,14 @@ class MainActivity : AppCompatActivity() {
             avoidClipSwitch.isChecked = v
         })
 
-        // Show the floating bubble only when a keyboard is open.
+        // Show the floating bubble only when a text input is focused.
         val bubbleSwitch = MaterialSwitch(this).apply {
             isChecked = prefs().getBoolean("bubble_keyboard_only", true)
             isClickable = false
         }
         root.addView(settingsRow(
-            "Show bubble only with keyboard",
-            "Hide the dictation bubble unless a text field is focused",
+            "Show bubble only in text fields",
+            "Hide the dictation bubble unless a text input is active",
             bubbleSwitch,
         ) {
             val v = !bubbleSwitch.isChecked
