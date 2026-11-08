@@ -59,6 +59,8 @@ class WhisperAccessibilityService : AccessibilityService() {
     private var feedbackView: TextView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
     private var feedbackLayoutParams: WindowManager.LayoutParams? = null
+    private var cancelView: FrameLayout? = null
+    private var cancelLayoutParams: WindowManager.LayoutParams? = null
     private var audioRecord: AudioRecord? = null
     private var pcmStream: ByteArrayOutputStream? = null
     private val handler = Handler(Looper.getMainLooper())
@@ -253,6 +255,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                         positionFeedback(it, params)
                         wm.updateViewLayout(feedbackView, it)
                     }
+                    repositionCancel()
                     true
                 }
                 MotionEvent.ACTION_UP -> {
@@ -267,6 +270,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                             positionFeedback(it, params)
                             wm.updateViewLayout(feedbackView, it)
                         }
+                        repositionCancel()
                     }
                     true
                 }
@@ -294,8 +298,34 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
         positionFeedback(feedbackParams, params)
 
+        // Cancel button (same size as the mic button), shown left of the bubble while recording.
+        val cancelBtn = TextView(this).apply {
+            text = "\u2715"
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setTextColor(0xFFFFFFFF.toInt())
+            background = circle(COLOR_IDLE)
+            contentDescription = "Cancel recording"
+            setOnClickListener { cancelRecording() }
+        }
+        val cancelOverlay = FrameLayout(this).apply {
+            addView(cancelBtn, FrameLayout.LayoutParams(buttonSize, buttonSize, Gravity.CENTER))
+            visibility = View.GONE
+        }
+        val cancelParams = WindowManager.LayoutParams(
+            ringSize, ringSize,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        layoutParams = params
+        cancelLayoutParams = cancelParams
+        cancelView = cancelOverlay
+        repositionCancel()
+
         wm.addView(overlay, params)
         wm.addView(feedback, feedbackParams)
+        wm.addView(cancelOverlay, cancelParams)
         overlayView = overlay
         button = img
         spinner = ring
@@ -314,6 +344,11 @@ class WhisperAccessibilityService : AccessibilityService() {
             wm.removeView(it)
             feedbackView = null
         }
+        cancelView?.let {
+            wm.removeView(it)
+            cancelView = null
+        }
+        cancelLayoutParams = null
         button = null
         spinner = null
         layoutParams = null
@@ -338,6 +373,40 @@ class WhisperAccessibilityService : AccessibilityService() {
         handler.post {
             spinner?.visibility = if (visible) View.VISIBLE else View.GONE
         }
+    }
+
+    /** Place the cancel button left of the bubble (right of it if there's no room). */
+    private fun repositionCancel() {
+        val view = cancelView ?: return
+        val cp = cancelLayoutParams ?: return
+        val bp = layoutParams ?: return
+        val size = (RING_DP * dp).toInt()
+        val margin = (MARGIN_DP * dp).toInt()
+        cp.x = if (bp.x - size >= margin) bp.x - size else bp.x + size
+        cp.y = bp.y
+        if (view.isAttachedToWindow) {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(view, cp)
+        }
+    }
+
+    private fun setCancelVisible(visible: Boolean) {
+        handler.post {
+            cancelView?.visibility = if (visible) View.VISIBLE else View.GONE
+            if (visible) repositionCancel()
+        }
+    }
+
+    private fun cancelRecording() {
+        if (state != State.RECORDING) return
+        state = State.IDLE // stops the capture loop
+        stopPulse()
+        setCancelVisible(false)
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        audioRecord?.release()
+        audioRecord = null
+        pcmStream = null
+        setAppearance(COLOR_IDLE)
+        showFeedback("Cancelled", 1200)
     }
 
     private fun positionFeedback(
@@ -416,6 +485,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         state = State.RECORDING
         setBusy(false)
         setAppearance(COLOR_RECORDING)
+        setCancelVisible(true)
         startPulse()
 
         thread {
@@ -430,6 +500,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun stopAndTranscribe() {
         state = State.TRANSCRIBING
         stopPulse()
+        setCancelVisible(false)
         setAppearance(COLOR_BUSY)
         setBusy(true)
 
