@@ -7,7 +7,10 @@ import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Bundle
@@ -43,7 +46,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val RING_DP = 56
         private const val FEEDBACK_OFFSET_DP = 64
 
-        private const val COLOR_IDLE = 0xDD1C1C1E.toInt()
+        private const val HOLD_THRESHOLD_MS = 350L
         private const val COLOR_RECORDING = 0xDDEF4444.toInt()
         private const val COLOR_BUSY = 0xDD6B6B6B.toInt()
         private const val COLOR_FEEDBACK_BG = 0xEE1C1C1E.toInt()
@@ -73,7 +76,11 @@ class WhisperAccessibilityService : AccessibilityService() {
     // Local transcription engine (loaded lazily)
     private var localTranscriber: LocalTranscriber? = null
 
+    private var focusRequest: AudioFocusRequest? = null
+    private var holding = false // current press started a hold-to-talk recording
     private val dp get() = resources.displayMetrics.density
+    private val scale get() = BubbleStyle.sizePct(prefs()) / 100f
+    private fun idleColor() = BubbleStyle.idleArgb(prefs())
     private val screenW get() = resources.displayMetrics.widthPixels
     private val screenH get() = resources.displayMetrics.heightPixels
 
@@ -127,6 +134,7 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         instance = null
+        resumeMedia()
         removeOverlay()
         super.onDestroy()
     }
@@ -203,9 +211,9 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     private fun showOverlay() {
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val buttonSize = (BTN_DP * dp).toInt()
-        val ringSize = (RING_DP * dp).toInt()
-        val pad = (PAD_DP * dp).toInt()
+        val buttonSize = (BTN_DP * dp * scale).toInt()
+        val ringSize = (RING_DP * dp * scale).toInt()
+        val pad = (PAD_DP * dp * scale).toInt()
         val margin = (MARGIN_DP * dp).toInt()
 
         val ring = ProgressBar(this).apply {
@@ -218,7 +226,7 @@ class WhisperAccessibilityService : AccessibilityService() {
             setImageResource(R.drawable.ic_mic)
             scaleType = ImageView.ScaleType.CENTER_INSIDE
             setPadding(pad, pad, pad, pad)
-            background = circle(COLOR_IDLE)
+            background = circle(idleColor())
         }
 
         val overlay = FrameLayout(this).apply {
@@ -239,15 +247,34 @@ class WhisperAccessibilityService : AccessibilityService() {
 
         var startX = 0; var startY = 0
         var touchX = 0f; var touchY = 0f
+        var dragging = false
+        val holdRunnable = Runnable {
+            if (state == State.IDLE && !dragging) {
+                holding = true
+                startRecording()
+                if (state != State.RECORDING) holding = false
+            }
+        }
 
         overlay.setOnTouchListener { v, ev ->
             when (ev.action) {
                 MotionEvent.ACTION_DOWN -> {
                     startX = params.x; startY = params.y
                     touchX = ev.rawX; touchY = ev.rawY
+                    dragging = false
+                    holding = false
+                    if (state == State.IDLE) handler.postDelayed(holdRunnable, HOLD_THRESHOLD_MS)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (holding) return@setOnTouchListener true
+                    if (!dragging) {
+                        if (abs(ev.rawX - touchX) + abs(ev.rawY - touchY) < TAP_THRESHOLD_DP * dp) {
+                            return@setOnTouchListener true
+                        }
+                        dragging = true
+                        handler.removeCallbacks(holdRunnable)
+                    }
                     params.x = startX + (ev.rawX - touchX).toInt()
                     params.y = startY + (ev.rawY - touchY).toInt()
                     wm.updateViewLayout(v, params)
@@ -258,9 +285,22 @@ class WhisperAccessibilityService : AccessibilityService() {
                     repositionCancel()
                     true
                 }
+                MotionEvent.ACTION_CANCEL -> {
+                    handler.removeCallbacks(holdRunnable)
+                    if (holding) {
+                        holding = false
+                        if (state == State.RECORDING) stopAndTranscribe()
+                    }
+                    true
+                }
                 MotionEvent.ACTION_UP -> {
+                    handler.removeCallbacks(holdRunnable)
                     val moved = abs(ev.rawX - touchX) + abs(ev.rawY - touchY)
-                    if (moved < TAP_THRESHOLD_DP * dp) {
+                    if (holding) {
+                        // Hold-to-talk: releasing the button ends the recording.
+                        holding = false
+                        if (state == State.RECORDING) stopAndTranscribe()
+                    } else if (moved < TAP_THRESHOLD_DP * dp) {
                         onTap()
                     } else {
                         params.x = if (params.x + ringSize / 2 > screenW / 2)
@@ -301,10 +341,10 @@ class WhisperAccessibilityService : AccessibilityService() {
         // Cancel button (same size as the mic button), shown left of the bubble while recording.
         val cancelBtn = TextView(this).apply {
             text = "\u2715"
-            textSize = 18f
+            textSize = 18f * scale
             gravity = Gravity.CENTER
             setTextColor(0xFFFFFFFF.toInt())
-            background = circle(COLOR_IDLE)
+            background = circle(idleColor())
             contentDescription = "Cancel recording"
             setOnClickListener { cancelRecording() }
         }
@@ -355,8 +395,11 @@ class WhisperAccessibilityService : AccessibilityService() {
         feedbackLayoutParams = null
     }
 
+    /** Rounded square (squircle-ish) used for the bubble and cancel buttons. */
     private fun circle(color: Int) = GradientDrawable().apply {
-        shape = GradientDrawable.OVAL; setColor(color)
+        shape = GradientDrawable.RECTANGLE
+        cornerRadius = BTN_DP * dp * scale * 0.3f
+        setColor(color)
     }
 
     private fun pill(color: Int) = GradientDrawable().apply {
@@ -380,7 +423,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         val view = cancelView ?: return
         val cp = cancelLayoutParams ?: return
         val bp = layoutParams ?: return
-        val size = (RING_DP * dp).toInt()
+        val size = (RING_DP * dp * scale).toInt()
         val margin = (MARGIN_DP * dp).toInt()
         cp.x = if (bp.x - size >= margin) bp.x - size else bp.x + size
         cp.y = bp.y
@@ -396,16 +439,63 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Ask other apps to pause playback (exclusive transient focus = pause, not duck). */
+    private fun pauseMedia() {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener { }
+            .build()
+        focusRequest = req
+        am.requestAudioFocus(req)
+    }
+
+    /** Release focus so the paused media resumes. */
+    private fun resumeMedia() {
+        val req = focusRequest ?: return
+        focusRequest = null
+        (getSystemService(AUDIO_SERVICE) as AudioManager).abandonAudioFocusRequest(req)
+    }
+
+    /** Rebuild the overlay after size/colour settings change, keeping its position. */
+    fun rebuildOverlay() {
+        handler.post {
+            val old = layoutParams
+            val oldVisibility = overlayView?.visibility ?: View.VISIBLE
+            removeOverlay()
+            showOverlay()
+            if (old != null) {
+                layoutParams?.let { p ->
+                    val ring = (RING_DP * dp * scale).toInt()
+                    val margin = (MARGIN_DP * dp).toInt()
+                    p.x = if (old.x > screenW / 2) screenW - ring - margin else margin
+                    p.y = old.y.coerceIn(0, maxOf(0, screenH - ring))
+                    (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(overlayView, p)
+                    feedbackLayoutParams?.let { positionFeedback(it, p) }
+                    repositionCancel()
+                }
+            }
+            overlayView?.visibility = oldVisibility
+            updateBubbleVisibility()
+        }
+    }
+
     private fun cancelRecording() {
         if (state != State.RECORDING) return
         state = State.IDLE // stops the capture loop
+        resumeMedia()
         stopPulse()
         setCancelVisible(false)
         try { audioRecord?.stop() } catch (_: Exception) {}
         audioRecord?.release()
         audioRecord = null
         pcmStream = null
-        setAppearance(COLOR_IDLE)
+        setAppearance(idleColor())
         showFeedback("Cancelled", 1200)
     }
 
@@ -483,6 +573,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         pcmStream = ByteArrayOutputStream()
         audioRecord!!.startRecording()
         state = State.RECORDING
+        pauseMedia()
         setBusy(false)
         setAppearance(COLOR_RECORDING)
         setCancelVisible(true)
@@ -499,6 +590,7 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     private fun stopAndTranscribe() {
         state = State.TRANSCRIBING
+        resumeMedia()
         stopPulse()
         setCancelVisible(false)
         setAppearance(COLOR_BUSY)
@@ -546,7 +638,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     toast("Local error: ${e.message}")
                     state = State.IDLE
                     setBusy(false)
-                    setAppearance(COLOR_IDLE)
+                    setAppearance(idleColor())
                 }
             }
         }
@@ -565,7 +657,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     toast("Error: ${result.error ?: "empty transcript"}")
                     state = State.IDLE
                     setBusy(false)
-                    setAppearance(COLOR_IDLE)
+                    setAppearance(idleColor())
                 }
             }
         }
@@ -577,7 +669,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 toast("No speech detected")
                 state = State.IDLE
                 setBusy(false)
-                setAppearance(COLOR_IDLE)
+                setAppearance(idleColor())
             }
             return
         }
@@ -591,7 +683,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 injectText(finalText, feedback = feedback, feedbackDurationMs = durMs)
                 state = State.IDLE
                 setBusy(false)
-                setAppearance(COLOR_IDLE)
+                setAppearance(idleColor())
             }
         }
 
@@ -682,7 +774,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         toast(msg)
         state = State.IDLE
         setBusy(false)
-        setAppearance(COLOR_IDLE)
+        setAppearance(idleColor())
     }
 
     // --- Text injection ---

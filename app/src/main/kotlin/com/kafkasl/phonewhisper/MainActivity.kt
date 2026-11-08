@@ -160,6 +160,68 @@ class MainActivity : AppCompatActivity() {
             WhisperAccessibilityService.instance?.refreshBubble()
         })
 
+        // Bubble size (100%..300% in 25% steps).
+        val steps = (BubbleStyle.MAX_PCT - BubbleStyle.MIN_PCT) / BubbleStyle.STEP_PCT
+        val sizeRow = settingsRow(
+            "Bubble size", "${BubbleStyle.sizePct(prefs())}%",
+        )
+        val sizeBar = SeekBar(this).apply {
+            max = steps
+            progress = (BubbleStyle.sizePct(prefs()) - BubbleStyle.MIN_PCT) / BubbleStyle.STEP_PCT
+            layoutParams = LinearLayout.LayoutParams(dp(160), LP_WRAP)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    val pct = BubbleStyle.MIN_PCT + p * BubbleStyle.STEP_PCT
+                    sizeRow.findViewWithTag<TextView>("subtitle")?.text = "$pct%"
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val pct = BubbleStyle.MIN_PCT + (sb?.progress ?: 0) * BubbleStyle.STEP_PCT
+                    prefs().edit().putInt(BubbleStyle.PREF_SIZE, pct).apply()
+                    WhisperAccessibilityService.instance?.rebuildOverlay()
+                }
+            })
+        }
+        sizeRow.addView(sizeBar)
+        root.addView(sizeRow)
+
+        // Bubble colour: 16 preset swatches (2 rows of 8).
+        root.addView(settingsRow("Bubble color", "Idle color of the dictation button"))
+        val swatches = mutableListOf<Pair<Int, View>>()
+        fun paintSwatches() {
+            val sel = BubbleStyle.color(prefs())
+            swatches.forEach { (c, v) ->
+                v.background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    cornerRadius = dp(10).toFloat()
+                    setColor(0xFF000000.toInt() or c)
+                    if (c == sel) setStroke(dp(3), attrColor(android.R.attr.textColorPrimary))
+                }
+            }
+        }
+        BubbleStyle.PALETTE.chunked(8).forEach { chunk ->
+            val line = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(16), dp(4), dp(16), dp(4))
+            }
+            chunk.forEach { c ->
+                val v = View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply {
+                        setMargins(dp(4), 0, dp(4), 0)
+                    }
+                    setOnClickListener {
+                        prefs().edit().putInt(BubbleStyle.PREF_COLOR, c).apply()
+                        paintSwatches()
+                        WhisperAccessibilityService.instance?.rebuildOverlay()
+                    }
+                }
+                swatches.add(c to v)
+                line.addView(v)
+            }
+            root.addView(line)
+        }
+        paintSwatches()
+
         // Models: "Local models" (installed) + "Suggested models" + Browse button.
         modelContainer = vertical(0)
         root.addView(modelContainer)
