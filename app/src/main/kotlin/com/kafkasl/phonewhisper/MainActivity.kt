@@ -14,6 +14,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
 import android.widget.*
 import kotlin.math.abs
 import androidx.appcompat.app.AppCompatActivity
@@ -498,8 +499,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Visible trash button at the start of a model row's right-hand controls. */
-    private fun addDeleteButton(row: LinearLayout, onDelete: () -> Unit) {
-        val right = row.getChildAt(1) as? LinearLayout ?: return
+    private fun addDeleteButton(row: View, onDelete: () -> Unit) {
+        val right = (row as? ViewGroup)?.getChildAt(1) as? LinearLayout ?: return
         val slot = dp(48)
         val btn = MaterialButton(this, null, com.google.android.material.R.attr.materialIconButtonStyle).apply {
             text = "\uD83D\uDDD1"
