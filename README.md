@@ -122,6 +122,16 @@ make adb-install # build + install via ADB
 make clean       # clean build artifacts
 ```
 
+## Releasing
+
+Releases are automatic (`.github/workflows/release.yml`):
+
+1. Bump `versionCode` and `versionName` in `app/build.gradle.kts`.
+2. Merge to `main`.
+3. If tag `v<versionName>` does not exist yet, the workflow runs tests, builds a signed release APK, creates the tag and publishes a GitHub Release with the APK. If the tag exists, the run is a no-op.
+
+Required repository secrets (Settings > Secrets and variables > Actions): `KEYSTORE_BASE64` (base64 of the keystore), `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`. If any is missing, the release job fails rather than publishing an unsigned APK.
+
 ## App compatibility
 
 Phone Whisper works best in apps that use standard Android text fields.
