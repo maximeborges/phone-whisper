@@ -27,12 +27,7 @@ class ModelBrowserActivity : AppCompatActivity() {
 
     private enum class Sort(val label: String) { DOWNLOADS("Downloads"), SIZE("Size"), NAME("Name") }
 
-    private val LANGUAGES = listOf(
-        "All" to "", "English" to "en", "French" to "fr", "German" to "de",
-        "Spanish" to "es", "Italian" to "it", "Portuguese" to "pt", "Dutch" to "nl",
-        "Russian" to "ru", "Chinese" to "zh", "Japanese" to "ja", "Korean" to "ko",
-    )
-    private val LANG_LABELS = LANGUAGES.associate { it.second to it.first.lowercase() }
+    private val LANGUAGES = listOf("All" to "") + Languages.ALL.map { it.name to it.code }
 
     private var all: List<HuggingFaceModelBrowser.HFModel> = emptyList()
     private val sizes = HashMap<String, Int>()          // repoId -> MB (present = known)
@@ -323,11 +318,7 @@ class ModelBrowserActivity : AppCompatActivity() {
 
     private fun matchesLang(hf: HuggingFaceModelBrowser.HFModel, code: String): Boolean {
         if (code.isBlank()) return true
-        val langs = hf.languages.lowercase()
-        if ("multilingual" in langs || "1600" in langs) return true
-        val tokens = langs.split(Regex("[^a-z]+")).filter { it.isNotBlank() }
-        if (code in tokens) return true
-        return LANG_LABELS[code]?.let { it in tokens } ?: false
+        return hf.langCodes?.contains(code) ?: true
     }
 
     // --- helpers ---

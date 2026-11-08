@@ -266,16 +266,20 @@ class MainActivity : AppCompatActivity() {
 
     // --- Recognition language ---
 
-    private val LANGS = listOf(
-        "English" to "en", "French" to "fr", "German" to "de", "Spanish" to "es",
-        "Italian" to "it", "Portuguese" to "pt", "Dutch" to "nl", "Russian" to "ru",
-        "Chinese" to "zh", "Japanese" to "ja", "Korean" to "ko",
-    )
+    /** Languages offered for the active model (all of them if it is unknown/any). */
+    private fun availableLangs(): List<Pair<String, String>> {
+        val active = prefs().getString("model_name", "") ?: ""
+        val supported = if (active.isBlank()) null
+            else Languages.supported(active, ModelArch.fromRepoName(active))
+        return Languages.ALL
+            .filter { supported == null || supported.isEmpty() || it.code in supported }
+            .map { it.name to it.code }
+    }
 
     private fun currentLangCodes(): List<String> =
         (prefs().getString("language_set", "") ?: "").split(",").map { it.trim() }.filter { it.isNotEmpty() }
 
-    private fun labelFor(code: String) = LANGS.firstOrNull { it.second == code }?.first ?: code
+    private fun labelFor(code: String) = Languages.name(code)
 
     /** Human summary of the language selection for the settings row subtitle. */
     private fun languageSummary(): String {
@@ -295,9 +299,10 @@ class MainActivity : AppCompatActivity() {
      * stored in "language" for the loader; the checked set in "language_set".
      */
     private fun showLanguagePicker() {
-        val labels = LANGS.map { it.first }.toTypedArray()
+        val langs = availableLangs()
+        val labels = langs.map { it.first }.toTypedArray()
         val cur = currentLangCodes().toMutableSet()
-        val checked = BooleanArray(LANGS.size) { LANGS[it].second in cur }
+        val checked = BooleanArray(langs.size) { langs[it].second in cur }
         fun persist(codes: List<String>) {
             prefs().edit()
                 .putString("language_set", codes.joinToString(","))
@@ -309,9 +314,9 @@ class MainActivity : AppCompatActivity() {
         android.app.AlertDialog.Builder(this)
             .setTitle("Languages (one = forced, several/none = auto-detect)")
             .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
-                if (isChecked) cur.add(LANGS[which].second) else cur.remove(LANGS[which].second)
+                if (isChecked) cur.add(langs[which].second) else cur.remove(langs[which].second)
             }
-            .setPositiveButton("Save") { _, _ -> persist(LANGS.map { it.second }.filter { it in cur }) }
+            .setPositiveButton("Save") { _, _ -> persist(langs.map { it.second }.filter { it in cur }) }
             .setNeutralButton("Auto-detect") { _, _ -> persist(emptyList()) }
             .setNegativeButton("Cancel", null)
             .show()

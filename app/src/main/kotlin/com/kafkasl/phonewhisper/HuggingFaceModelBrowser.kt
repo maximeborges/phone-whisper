@@ -26,12 +26,6 @@ object HuggingFaceModelBrowser {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    /** ISO codes we recognise inside repo names for language inference. */
-    private val LANG_CODES = setOf(
-        "en", "zh", "de", "es", "fr", "it", "ru", "ja", "ko", "yue", "vi", "nl",
-        "pt", "uk", "pl", "hr", "be", "ar", "hi", "fa", "tr", "id", "th",
-    )
-
     data class HFModel(
         val repoId: String,        // "csukuangfj/sherpa-onnx-whisper-base"
         val archive: String,       // repo name after the slash (== model dir name)
@@ -40,7 +34,10 @@ object HuggingFaceModelBrowser {
         val languages: String,     // human string, e.g. "en, de, es, fr" / "multilingual"
         val downloads: Int,
         val sizeMb: Int,           // 0 = not yet known (fetched lazily)
-    )
+    ) {
+        /** Supported language codes; null = any, empty = unknown. */
+        val langCodes: Set<String>? get() = Languages.supported(archive, arch)
+    }
 
     sealed class BrowseResult {
         data class Success(val models: List<HFModel>) : BrowseResult()
@@ -85,7 +82,7 @@ object HuggingFaceModelBrowser {
                     archive = name,
                     displayName = name.removePrefix("sherpa-onnx-"),
                     arch = arch,
-                    languages = inferLanguages(name, arch),
+                    languages = Languages.label(name, arch),
                     downloads = obj.optInt("downloads", 0),
                     sizeMb = 0,
                 )
@@ -109,18 +106,6 @@ object HuggingFaceModelBrowser {
         return hasModel && hasTokens
     }
 
-    private fun inferLanguages(name: String, arch: ModelArch): String {
-        val n = name.lowercase()
-        when (arch) {
-            ModelArch.WHISPER -> return if (".en" in n) "English" else "multilingual"
-            ModelArch.SENSE_VOICE -> return "zh, en, ja, ko, yue"
-            ModelArch.DOLPHIN -> return "multilingual"
-            ModelArch.OMNILINGUAL -> return "1600+ languages"
-            else -> {}
-        }
-        val found = n.split('-', '_', '.').filter { it in LANG_CODES }.distinct()
-        return if (found.isNotEmpty()) found.joinToString(", ") else ""
-    }
 
     /** Fetch the actual download size (needed int8 files + tokens) for one repo.
      *  Blocking — run off the main thread. Returns 0 if unknown. Mirrors
