@@ -26,6 +26,15 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Download Gradle wrapper (with retries)
+        run: |
+          for i in 1 2 3 4 5; do
+            ./gradlew --version && exit 0
+            echo "::warning::Gradle wrapper download failed (attempt $i/5), retrying in $((i*20))s"
+            sleep $((i*20))
+          done
+          exit 1
+
       - name: Run unit tests
         run: ./gradlew testDebugUnitTest
 
