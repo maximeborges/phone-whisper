@@ -90,7 +90,7 @@ class MainActivity : AppCompatActivity() {
         statusSubtitle = statusRow.findViewWithTag("subtitle")
         root.addView(statusRow)
 
-        // --- Setup Section ---
+        // --- Setup ---
         root.addView(sectionHeader("Setup"))
         
         val audioRow = settingsRow("Audio permission", "Checking...") {
@@ -107,8 +107,23 @@ class MainActivity : AppCompatActivity() {
         accRowSub = accRow.findViewWithTag("subtitle")
         root.addView(accRow)
 
-        // --- Engine Section ---
-        
+        val keepAliveSwitch = MaterialSwitch(this).apply {
+            isChecked = prefs().getBoolean("keep_alive_notification", true)
+            isClickable = false
+        }
+        root.addView(settingsRow(
+            "Persistent notification",
+            "Keeps the app alive in the background",
+            keepAliveSwitch,
+        ) {
+            val v = !keepAliveSwitch.isChecked
+            prefs().edit().putBoolean("keep_alive_notification", v).apply()
+            keepAliveSwitch.isChecked = v
+            WhisperAccessibilityService.instance?.setKeepAlive(v)
+        })
+
+        // --- Transcription ---
+        root.addView(sectionHeader("Transcription"))
         val isCloud = !prefs().getBoolean("use_local", true)
         
         val cloudSwitch = MaterialSwitch(this).apply {
@@ -123,109 +138,22 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(cloudRow)
 
+        val keyRow = settingsRow("OpenAI API Key", "Tap to set") { promptApiKey() }
+        keyRowSub = keyRow.findViewWithTag("subtitle")
+        root.addView(keyRow)
+
         // Recognition language (applies to Whisper/SenseVoice/Canary; "" = auto).
         val langRow = settingsRow("Recognition language",
             languageSummary()) { showLanguagePicker() }
         langRowView = langRow
         root.addView(langRow)
 
-        // Avoid overwriting the clipboard when a keyboard is open (insert directly).
-        val avoidClipSwitch = MaterialSwitch(this).apply {
-            isChecked = prefs().getBoolean("avoid_clipboard_when_keyboard", true)
-            isClickable = false
-        }
-        root.addView(settingsRow(
-            "Avoid clipboard when keyboard is open",
-            "Insert text directly instead of copy-paste",
-            avoidClipSwitch,
-        ) {
-            val v = !avoidClipSwitch.isChecked
-            prefs().edit().putBoolean("avoid_clipboard_when_keyboard", v).apply()
-            avoidClipSwitch.isChecked = v
-        })
-
-        // Show the floating bubble only when a text input is focused.
-        val bubbleSwitch = MaterialSwitch(this).apply {
-            isChecked = prefs().getBoolean("bubble_keyboard_only", true)
-            isClickable = false
-        }
-        root.addView(settingsRow(
-            "Show bubble only in text fields",
-            "Hide the dictation bubble unless a text input is active",
-            bubbleSwitch,
-        ) {
-            val v = !bubbleSwitch.isChecked
-            prefs().edit().putBoolean("bubble_keyboard_only", v).apply()
-            bubbleSwitch.isChecked = v
-            WhisperAccessibilityService.instance?.refreshBubble()
-        })
-
-        // Bubble size (100%..300% in 25% steps).
-        val steps = (BubbleStyle.MAX_PCT - BubbleStyle.MIN_PCT) / BubbleStyle.STEP_PCT
-        val sizeRow = settingsRow(
-            "Bubble size", "${BubbleStyle.sizePct(prefs())}%",
-        )
-        val sizeBar = SeekBar(this).apply {
-            max = steps
-            progress = (BubbleStyle.sizePct(prefs()) - BubbleStyle.MIN_PCT) / BubbleStyle.STEP_PCT
-            layoutParams = LinearLayout.LayoutParams(dp(160), LP_WRAP)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    val pct = BubbleStyle.MIN_PCT + p * BubbleStyle.STEP_PCT
-                    sizeRow.findViewWithTag<TextView>("subtitle")?.text = "$pct%"
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {
-                    val pct = BubbleStyle.MIN_PCT + (sb?.progress ?: 0) * BubbleStyle.STEP_PCT
-                    prefs().edit().putInt(BubbleStyle.PREF_SIZE, pct).apply()
-                    WhisperAccessibilityService.instance?.rebuildOverlay()
-                }
-            })
-        }
-        sizeRow.addView(sizeBar)
-        root.addView(sizeRow)
-
-        // Bubble colour: 16 preset swatches (2 rows of 8).
-        root.addView(settingsRow("Bubble color", "Idle color of the dictation button"))
-        val swatches = mutableListOf<Pair<Int, View>>()
-        fun paintSwatches() {
-            val sel = BubbleStyle.color(prefs())
-            swatches.forEach { (c, v) ->
-                v.background = android.graphics.drawable.GradientDrawable().apply {
-                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                    cornerRadius = dp(10).toFloat()
-                    setColor(0xFF000000.toInt() or c)
-                    if (c == sel) setStroke(dp(3), attrColor(android.R.attr.textColorPrimary))
-                }
-            }
-        }
-        BubbleStyle.PALETTE.chunked(8).forEach { chunk ->
-            val line = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(dp(16), dp(4), dp(16), dp(4))
-            }
-            chunk.forEach { c ->
-                val v = View(this).apply {
-                    layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply {
-                        setMargins(dp(4), 0, dp(4), 0)
-                    }
-                    setOnClickListener {
-                        prefs().edit().putInt(BubbleStyle.PREF_COLOR, c).apply()
-                        paintSwatches()
-                        WhisperAccessibilityService.instance?.rebuildOverlay()
-                    }
-                }
-                swatches.add(c to v)
-                line.addView(v)
-            }
-            root.addView(line)
-        }
-        paintSwatches()
 
         // Models: "Local models" (installed) + "Suggested models" + Browse button.
         modelContainer = vertical(0)
         root.addView(modelContainer)
         rebuildModelSections()
+
 
         // --- Post-Processing Section ---
         root.addView(sectionHeader("Post-Processing"))
@@ -296,12 +224,91 @@ class MainActivity : AppCompatActivity() {
         promptRowSub.ellipsize = android.text.TextUtils.TruncateAt.END
         root.addView(promptRow)
 
-        // --- Settings Section ---
-        root.addView(sectionHeader("Settings"))
-        
-        val keyRow = settingsRow("OpenAI API Key", "Tap to set") { promptApiKey() }
-        keyRowSub = keyRow.findViewWithTag("subtitle")
-        root.addView(keyRow)
+
+        // --- Bubble ---
+        root.addView(sectionHeader("Bubble"))
+        // Avoid overwriting the clipboard when a keyboard is open (insert directly).
+        val avoidClipSwitch = MaterialSwitch(this).apply {
+            isChecked = prefs().getBoolean("avoid_clipboard_when_keyboard", true)
+            isClickable = false
+        }
+        root.addView(settingsRow(
+            "Avoid clipboard when keyboard is open",
+            "Insert text directly instead of copy-paste",
+            avoidClipSwitch,
+        ) {
+            val v = !avoidClipSwitch.isChecked
+            prefs().edit().putBoolean("avoid_clipboard_when_keyboard", v).apply()
+            avoidClipSwitch.isChecked = v
+        })
+
+        // Show the floating bubble only when a text input is focused.
+        val bubbleSwitch = MaterialSwitch(this).apply {
+            isChecked = prefs().getBoolean("bubble_keyboard_only", true)
+            isClickable = false
+        }
+        root.addView(settingsRow(
+            "Show bubble only in text fields",
+            "Hide the dictation bubble unless a text input is active",
+            bubbleSwitch,
+        ) {
+            val v = !bubbleSwitch.isChecked
+            prefs().edit().putBoolean("bubble_keyboard_only", v).apply()
+            bubbleSwitch.isChecked = v
+            WhisperAccessibilityService.instance?.refreshBubble()
+        })
+
+        // Bubble size (100%..300% in 25% steps).
+        val steps = (BubbleStyle.MAX_PCT - BubbleStyle.MIN_PCT) / BubbleStyle.STEP_PCT
+        val sizeRow = settingsRow(
+            "Bubble size", "${BubbleStyle.sizePct(prefs())}%",
+        )
+        val sizeBar = SeekBar(this).apply {
+            max = steps
+            progress = (BubbleStyle.sizePct(prefs()) - BubbleStyle.MIN_PCT) / BubbleStyle.STEP_PCT
+            layoutParams = LinearLayout.LayoutParams(dp(160), LP_WRAP)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    val pct = BubbleStyle.MIN_PCT + p * BubbleStyle.STEP_PCT
+                    sizeRow.findViewWithTag<TextView>("subtitle")?.text = "$pct%"
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val pct = BubbleStyle.MIN_PCT + (sb?.progress ?: 0) * BubbleStyle.STEP_PCT
+                    prefs().edit().putInt(BubbleStyle.PREF_SIZE, pct).apply()
+                    WhisperAccessibilityService.instance?.rebuildOverlay()
+                }
+            })
+        }
+        sizeRow.addView(sizeBar)
+        root.addView(sizeRow)
+
+        // Bubble colour: one row with a swatch preview; the palette opens in a dialog.
+        val colorPreview = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
+        }
+        fun paintPreview() {
+            colorPreview.background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = dp(10).toFloat()
+                setColor(0xFF000000.toInt() or BubbleStyle.color(prefs()))
+            }
+        }
+        paintPreview()
+        val colorRow = settingsRow("Bubble color", "Tap to choose from 32 colors", colorPreview) {
+            showBubbleColorPicker { paintPreview() }
+        }
+        root.addView(colorRow)
+
+        // Version footer
+        val versionName = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
+        root.addView(TextView(this).apply {
+            text = "Phone Whisper v$versionName"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setTextColor(attrColor(android.R.attr.textColorSecondary))
+            setPadding(dp(24), dp(32), dp(24), dp(48))
+        })
 
         setContentView(ScrollView(this).apply {
             setBackgroundColor(attrColor(android.R.attr.colorBackground))
@@ -311,7 +318,10 @@ class MainActivity : AppCompatActivity() {
         if (!hasPerm(Manifest.permission.RECORD_AUDIO)) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
         }
-        
+        if (android.os.Build.VERSION.SDK_INT >= 33 && !hasPerm(Manifest.permission.POST_NOTIFICATIONS)) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
+        }
+
         refresh()
     }
 
@@ -398,7 +408,9 @@ class MainActivity : AppCompatActivity() {
             modelContainer.addView(sectionHeader("Local models"))
             for (a in installed) {
                 val model = displayModel(a)
-                modelContainer.addView(swipeToDelete(buildModelRow(model)) { confirmDelete(model) })
+                val modelRow = buildModelRow(model)
+                addDeleteButton(modelRow) { confirmDelete(model) }
+                modelContainer.addView(swipeToDelete(modelRow) { confirmDelete(model) })
             }
         }
 
@@ -483,6 +495,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
         return container
+    }
+
+    /** Visible trash button at the start of a model row's right-hand controls. */
+    private fun addDeleteButton(row: LinearLayout, onDelete: () -> Unit) {
+        val right = row.getChildAt(1) as? LinearLayout ?: return
+        val slot = dp(48)
+        val btn = MaterialButton(this, null, com.google.android.material.R.attr.materialIconButtonStyle).apply {
+            text = "\uD83D\uDDD1"
+            textSize = 18f
+            contentDescription = "Delete model"
+            setOnClickListener { onDelete() }
+        }
+        right.addView(btn, 0, LinearLayout.LayoutParams(slot, slot))
     }
 
     private fun confirmDelete(model: Model) {
@@ -839,7 +864,7 @@ class MainActivity : AppCompatActivity() {
         for (m in ModelDownloader.CLEANUP_MODELS) {
             val row = buildCleanupRow(m)
             list.addView(
-                if (ModelDownloader.isCleanupInstalled(this, m.id)) swipeToDelete(row) { confirmDeleteCleanup(m) }
+                if (ModelDownloader.isCleanupInstalled(this, m.id)) run { addDeleteButton(row) { confirmDeleteCleanup(m) }; swipeToDelete(row) { confirmDeleteCleanup(m) } }
                 else row
             )
         }
@@ -1089,6 +1114,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     // --- UI Helpers ---
+
+    private fun showBubbleColorPicker(onPicked: () -> Unit) {
+        val grid = GridLayout(this).apply {
+            columnCount = 8
+            setPadding(dp(12), dp(16), dp(12), dp(8))
+        }
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Bubble color")
+            .setView(grid)
+            .setNegativeButton("Close", null)
+            .create()
+        val sel = BubbleStyle.color(prefs())
+        BubbleStyle.PALETTE.forEach { c ->
+            grid.addView(View(this).apply {
+                layoutParams = GridLayout.LayoutParams().apply {
+                    width = dp(34); height = dp(34); setMargins(dp(3), dp(3), dp(3), dp(3))
+                }
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    cornerRadius = dp(10).toFloat()
+                    setColor(0xFF000000.toInt() or c)
+                    if (c == sel) setStroke(dp(3), attrColor(android.R.attr.textColorPrimary))
+                }
+                setOnClickListener {
+                    prefs().edit().putInt(BubbleStyle.PREF_COLOR, c).apply()
+                    WhisperAccessibilityService.instance?.rebuildOverlay()
+                    onPicked()
+                    dialog.dismiss()
+                }
+            })
+        }
+        dialog.show()
+    }
 
     private fun settingsRow(title: String, subtitle: String, widget: View? = null, onClick: (() -> Unit)? = null): LinearLayout {
         val row = LinearLayout(this).apply {

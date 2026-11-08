@@ -12,7 +12,7 @@ object BubbleStyle {
     const val STEP_PCT = 25
     const val DEFAULT_COLOR = 0x1C1C1E
 
-    /** 16 preset RGB colours (white mic icon stays readable on all of them). */
+    /** 32 preset RGB colours (white mic icon stays readable on all of them). */
     val PALETTE: List<Int> = listOf(
         0x1C1C1E, // graphite
         0x334155, // slate
@@ -30,6 +30,23 @@ object BubbleStyle {
         0x7C3AED, // violet
         0x4F46E5, // indigo
         0x78350F, // brown
+        // second set
+        0x241773, // raven purple
+        0x0F172A, // midnight
+        0x4B5563, // cool grey
+        0x155E75, // deep cyan
+        0x065F46, // emerald
+        0x3F6212, // moss
+        0x854D0E, // bronze
+        0x9A3412, // rust
+        0x9F1239, // raspberry
+        0x701A75, // plum
+        0x581C87, // grape
+        0x1D4ED8, // cobalt
+        0x0369A1, // ocean
+        0x15803D, // forest
+        0xBE185D, // magenta
+        0x6D28D9, // ultraviolet
     )
 
     fun sizePct(p: SharedPreferences): Int =
