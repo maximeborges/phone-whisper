@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
     tags:
@@ -40,6 +41,11 @@ jobs:
               exit 1
             fi
             TAG="v${VERSION}"
+            if [ "${GITHUB_REF_NAME}" != "main" ]; then
+              # Manual run on a feature branch: snapshot prerelease, never clashes with real tags
+              SLUG=$(echo "${GITHUB_REF_NAME}" | tr -c 'A-Za-z0-9\n' '-' | cut -c1-40)
+              TAG="${TAG}-${SLUG}.${GITHUB_RUN_NUMBER}"
+            fi
             if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
               echo "Tag ${TAG} already exists - nothing to release."
               echo "skip=true" >> "$GITHUB_OUTPUT"
